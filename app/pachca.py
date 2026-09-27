@@ -93,10 +93,16 @@ class Pachca:
         return data.get("data", {})
 
     async def send_to_thread(
-        self, thread_chat_id: int, content: str, buttons: ButtonRows | None = None
+        self, thread_id: int, content: str, buttons: ButtonRows | None = None
     ) -> dict[str, Any]:
+        """Сообщение в тред.
+
+        entity_id здесь — id треда (то, что вернул POST /messages/{id}/thread),
+        а не chat_id треда: с chat_id Пачка отвечает 404. В этом же виде
+        приходят и входящие сообщения треда, по нему их и сопоставляем.
+        """
         return await self.send_message(
-            entity_id=thread_chat_id, entity_type="thread", content=content, buttons=buttons
+            entity_id=thread_id, entity_type="thread", content=content, buttons=buttons
         )
 
 

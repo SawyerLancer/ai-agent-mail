@@ -33,7 +33,7 @@ async def poll_once() -> int:
             first_run = last_uid == 0
 
         try:
-            fresh = await mail.list_new(since_uid=last_uid)
+            fresh, top_uid = await mail.list_new(since_uid=last_uid)
         except Exception:  # noqa: BLE001 - сеть/IMAP отвалились, попробуем в следующий раз
             log.error("не удалось получить список писем", exc_info=True)
             return 0
@@ -41,18 +41,12 @@ async def poll_once() -> int:
         if not fresh:
             # UID меньше сохранённого = папку пересоздали (сменился UIDVALIDITY).
             # Сдвигаем точку отсчёта на текущий максимум, ничего не рассылая.
-            try:
-                current = await mail.list_new(since_uid=0)
-            except Exception:  # noqa: BLE001
-                return 0
-            if current:
-                top = max(x["_uid"] for x in current)
-                if top < last_uid:
-                    log.warning(
-                        "UID обнулились (было %s, стало %s): папку пересоздали, сбрасываю точку",
-                        last_uid, top,
-                    )
-                    _reset_uid(top)
+            if top_uid is not None and top_uid < last_uid:
+                log.warning(
+                    "UID обнулились (было %s, стало %s): папку пересоздали, сбрасываю точку",
+                    last_uid, top_uid,
+                )
+                _reset_uid(top_uid)
             return 0
 
         # Первый запуск: не заливаем канал историей, просто фиксируем точку отсчёта.
@@ -112,29 +106,45 @@ async def _publish(meta: dict[str, Any]) -> bool:
             return False
         pk = email.id
 
-    # Тело тянем лениво — только чтобы показать превью и выжимку.
-    body = ""
+    # Строка в базе — это уже заявка на публикацию: она держит дедупликацию,
+    # пока карточка готовится. Если опубликовать не удалось, заявку снимаем,
+    # иначе дедупликация навсегда спрячет письмо, которого никто не видел.
     try:
-        content = await mail.get_body(uid)
-        body = str(content.get("body") or content.get("content") or "")
-    except Exception:  # noqa: BLE001 - карточка полезна и без тела
-        log.warning("не удалось получить тело письма uid=%s", uid, exc_info=True)
+        # Тело тянем лениво — только чтобы показать превью и выжимку.
+        body = ""
+        try:
+            content = await mail.get_body(uid)
+            body = str(content.get("body") or content.get("content") or "")
+        except Exception:  # noqa: BLE001 - карточка полезна и без тела
+            log.warning("не удалось получить тело письма uid=%s", uid, exc_info=True)
 
-    summary = await summarize(sender=sender, subject=subject, body=body) if body else ""
-    preview = _preview(body)
+        summary = await summarize(sender=sender, subject=subject, body=body) if body else ""
+        preview = _preview(body)
 
+        with SessionLocal() as s:
+            email = s.get(TrackedEmail, pk)
+            assert email is not None
+            text = cards.email_card(email, preview, summary, date)
+            msg = await pachca.send_message(
+                entity_id=settings.pachca_channel_id,
+                content=text,
+                buttons=cards.email_buttons(pk),
+            )
+            email.pachca_message_id = msg.get("id")
+            s.commit()
+    except Exception:
+        _drop_claim(pk)
+        raise
+    return True
+
+
+def _drop_claim(pk: int) -> None:
+    """Убрать незавершённую заявку на публикацию, чтобы письмо повторилось."""
     with SessionLocal() as s:
         email = s.get(TrackedEmail, pk)
-        assert email is not None
-        text = cards.email_card(email, preview, summary, date)
-        msg = await pachca.send_message(
-            entity_id=settings.pachca_channel_id,
-            content=text,
-            buttons=cards.email_buttons(pk),
-        )
-        email.pachca_message_id = msg.get("id")
-        s.commit()
-    return True
+        if email is not None and email.pachca_message_id is None:
+            s.delete(email)
+            s.commit()
 
 
 def _reset_uid(uid: int) -> None:

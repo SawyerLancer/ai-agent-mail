@@ -68,7 +68,7 @@ async def handle_message(event: dict[str, Any]) -> None:
     if not user_allowed(user_id):
         return
 
-    thread_chat_id = int(event.get("entity_id") or 0)
+    thread_id = int(event.get("entity_id") or 0)   # entity_id треда = его id
     text = str(event.get("content") or "").strip()
     if not text:
         return
@@ -76,7 +76,7 @@ async def handle_message(event: dict[str, Any]) -> None:
     with SessionLocal() as s:
         draft = s.scalar(
             select(Draft)
-            .where(Draft.thread_chat_id == thread_chat_id, Draft.status == "editing")
+            .where(Draft.thread_id == thread_id, Draft.status == "editing")
             .order_by(Draft.id.desc())
         )
         if draft is None:
@@ -98,7 +98,7 @@ async def handle_message(event: dict[str, Any]) -> None:
             new_text, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
         if old_preview:
             await pachca.drop_buttons(old_preview, content="_Черновик обновлён ниже._")
-        msg = await pachca.send_to_thread(thread_chat_id, new_text, buttons)
+        msg = await pachca.send_to_thread(thread_id, new_text, buttons)
         _remember_preview(draft_id, msg.get("id"))
         return
 
@@ -109,7 +109,7 @@ async def handle_message(event: dict[str, Any]) -> None:
     except Exception:  # noqa: BLE001 - ошибку модели показываем человеку
         log.error("LLM не смог переписать черновик", exc_info=True)
         await pachca.send_to_thread(
-            thread_chat_id, "Не удалось переписать черновик — модель недоступна. Попробуйте ещё раз."
+            thread_id, "Не удалось переписать черновик — модель недоступна. Попробуйте ещё раз."
         )
         return
 
@@ -122,32 +122,32 @@ async def handle_message(event: dict[str, Any]) -> None:
 
     if old_preview:
         await pachca.drop_buttons(old_preview, content="_Черновик обновлён ниже._")
-    msg = await pachca.send_to_thread(thread_chat_id, new_text, buttons)
+    msg = await pachca.send_to_thread(thread_id, new_text, buttons)
     _remember_preview(draft_id, msg.get("id"))
 
 
 # --- действия по письму ---
 
 async def _thread_for(email_pk: int) -> tuple[int, TrackedEmail]:
-    """Найти или создать тред под карточкой письма."""
+    """Найти или создать тред под карточкой письма. Возвращает id треда."""
     with SessionLocal() as s:
         email = s.get(TrackedEmail, email_pk)
         if email is None:
             raise LookupError(f"письмо {email_pk} не найдено")
-        if email.thread_chat_id:
-            return email.thread_chat_id, email
+        if email.thread_id:
+            return email.thread_id, email
         if not email.pachca_message_id:
             raise LookupError(f"у письма {email_pk} нет карточки в Пачке")
         thread = await pachca.create_thread(email.pachca_message_id)
         email.thread_id = thread.get("id")
         email.thread_chat_id = thread.get("chat_id")
         s.commit()
-        return int(email.thread_chat_id), email
+        return int(email.thread_id), email
 
 
 async def _start_reply(email_pk: int, chat_id: int) -> None:
-    thread_chat_id, email = await _thread_for(email_pk)
-    await pachca.send_to_thread(thread_chat_id, "Готовлю черновик ответа…")
+    thread_id, email = await _thread_for(email_pk)
+    await pachca.send_to_thread(thread_id, "Готовлю черновик ответа…")
 
     body = await _body_of(email)
     try:
@@ -155,29 +155,29 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
     except Exception:  # noqa: BLE001
         log.error("LLM не смог составить черновик", exc_info=True)
         await pachca.send_to_thread(
-            thread_chat_id, "Модель недоступна — черновик не составлен. Нажмите «Ответить» снова."
+            thread_id, "Модель недоступна — черновик не составлен. Нажмите «Ответить» снова."
         )
         return
 
     with SessionLocal() as s:
         draft = Draft(
-            email_pk=email_pk, thread_chat_id=thread_chat_id, kind="reply", body=text
+            email_pk=email_pk, thread_id=thread_id, kind="reply", body=text
         )
         s.add(draft)
         s.commit()
         card, buttons = cards.draft_card(draft), cards.draft_buttons(draft.id)
         draft_id = draft.id
 
-    msg = await pachca.send_to_thread(thread_chat_id, card, buttons)
+    msg = await pachca.send_to_thread(thread_id, card, buttons)
     _remember_preview(draft_id, msg.get("id"))
 
 
 async def _start_forward(email_pk: int, chat_id: int) -> None:
-    thread_chat_id, email = await _thread_for(email_pk)
+    thread_id, email = await _thread_for(email_pk)
     with SessionLocal() as s:
         draft = Draft(
             email_pk=email_pk,
-            thread_chat_id=thread_chat_id,
+            thread_id=thread_id,
             kind="forward",
             body="(без комментария)",
         )
@@ -186,7 +186,7 @@ async def _start_forward(email_pk: int, chat_id: int) -> None:
         draft_id = draft.id
 
     msg = await pachca.send_to_thread(
-        thread_chat_id,
+        thread_id,
         "Кому переслать письмо? Напишите адрес в этот тред "
         "(можно несколько через запятую). Следующим сообщением можно добавить "
         "комментарий к пересылке.",
@@ -196,16 +196,16 @@ async def _start_forward(email_pk: int, chat_id: int) -> None:
 
 
 async def _show_full(email_pk: int, chat_id: int) -> None:
-    thread_chat_id, email = await _thread_for(email_pk)
+    thread_id, email = await _thread_for(email_pk)
     body = await _body_of(email)
     if not body:
-        await pachca.send_to_thread(thread_chat_id, "Не удалось получить текст письма.")
+        await pachca.send_to_thread(thread_id, "Не удалось получить текст письма.")
         return
     # Сообщения Пачки не бесконечные — режем длинное тело на части.
     chunks = [body[i : i + 3500] for i in range(0, min(len(body), 14000), 3500)]
     for i, chunk in enumerate(chunks, 1):
         prefix = f"**Полный текст ({i}/{len(chunks)})**\n\n" if len(chunks) > 1 else ""
-        await pachca.send_to_thread(thread_chat_id, prefix + chunk)
+        await pachca.send_to_thread(thread_id, prefix + chunk)
 
 
 async def _archive(email_pk: int, chat_id: int, message_id: int) -> None:
@@ -263,6 +263,7 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         if email is None:
             return
         kind, body, recipients = draft.kind, draft.body, draft.recipients
+        thread_id = draft.thread_id
         uid, subject, sender = email.uid, email.subject, email.sender
         rfc_id = email.rfc_message_id
 
@@ -270,7 +271,7 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         if kind == "forward":
             if not recipients:
                 await pachca.send_to_thread(
-                    chat_id, "Сначала укажите адрес получателя в этом треде."
+                    thread_id, "Сначала укажите адрес получателя в этом треде."
                 )
                 return
             await mail.forward(uid=uid, to=_split(recipients), note=body)
@@ -279,7 +280,7 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
             to = _address_of(sender)
             if not to:
                 await pachca.send_to_thread(
-                    chat_id, f"Не разобрал адрес отправителя ({sender}). Отправка отменена."
+                    thread_id, f"Не разобрал адрес отправителя ({sender}). Отправка отменена."
                 )
                 return
             await mail.send(
@@ -292,7 +293,7 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
             done = f"📨 Ответ отправлен на {to}"
     except Exception as exc:  # noqa: BLE001 - причину показываем человеку
         log.error("отправка не удалась", exc_info=True)
-        await pachca.send_to_thread(chat_id, f"Отправить не удалось: {exc}")
+        await pachca.send_to_thread(thread_id, f"Отправить не удалось: {exc}")
         return
 
     with SessionLocal() as s:
@@ -311,7 +312,7 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         email = s.get(TrackedEmail, draft.email_pk)
         if email is None:
             return
-        thread_chat_id = draft.thread_chat_id
+        thread_id = draft.thread_id
 
     body = await _body_of(email)
     try:
@@ -323,7 +324,7 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         )
     except Exception:  # noqa: BLE001
         log.error("LLM не смог перегенерировать черновик", exc_info=True)
-        await pachca.send_to_thread(thread_chat_id, "Модель недоступна, черновик оставлен как был.")
+        await pachca.send_to_thread(thread_id, "Модель недоступна, черновик оставлен как был.")
         return
 
     with SessionLocal() as s:
@@ -334,7 +335,7 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         card, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
 
     await pachca.drop_buttons(message_id, content="_Новый вариант ниже._")
-    msg = await pachca.send_to_thread(thread_chat_id, card, buttons)
+    msg = await pachca.send_to_thread(thread_id, card, buttons)
     _remember_preview(draft_id, msg.get("id"))
 
 

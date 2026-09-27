@@ -36,7 +36,10 @@ class AnthropicLLM(LLM):
     def __init__(self) -> None:
         from anthropic import AsyncAnthropic
 
-        kwargs = {"api_key": settings.anthropic_api_key}
+        kwargs: dict[str, object] = {
+            "api_key": settings.anthropic_api_key,
+            "timeout": float(settings.llm_timeout),
+        }
         if settings.anthropic_base_url:
             kwargs["base_url"] = settings.anthropic_base_url
         self._client = AsyncAnthropic(**kwargs)
@@ -58,7 +61,9 @@ class DeepSeekLLM(LLM):
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            timeout=float(settings.llm_timeout),
         )
 
     async def complete(self, system: str, prompt: str) -> str:

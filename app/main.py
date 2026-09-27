@@ -25,6 +25,10 @@ logging.basicConfig(
     level=settings.log_level.upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Чужие библиотеки на INFO заливают журнал так, что своих строк не видно.
+for _noisy in ("httpx", "apscheduler.executors.default"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("bot")
 
 scheduler = AsyncIOScheduler(timezone="UTC")

@@ -64,7 +64,7 @@ class Draft(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email_pk: Mapped[int] = mapped_column(Integer, index=True)
-    thread_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    thread_id: Mapped[int] = mapped_column(BigInteger, index=True)
     kind: Mapped[str] = mapped_column(String(16))       # reply | forward
     status: Mapped[str] = mapped_column(String(16), default="editing")  # editing|sent|cancelled
     body: Mapped[str] = mapped_column(Text, default="")

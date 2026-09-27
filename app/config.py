@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
     deepseek_base_url: str = "https://api.deepseek.com"
     llm_max_tokens: int = 1500
+    llm_timeout: int = 120                   # с; чтобы джоба не висела на модели
     signature: str = ""                      # подпись в конце письма
 
     # --- Почта (через MCP) ---
@@ -40,6 +41,7 @@ class Settings(BaseSettings):
     mailbox: str = "INBOX"
     poll_interval: int = 60                  # секунд
     poll_page_size: int = 50
+    mcp_timeout: int = 120                   # с; зависший вызов MCP иначе встаёт навсегда
     preview_chars: int = 700                 # сколько текста письма показывать в чате
     body_chars_for_llm: int = 6000           # сколько отдаём модели
 

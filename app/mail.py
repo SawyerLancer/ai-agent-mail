@@ -8,11 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import AsyncExitStack
+import os
+from contextlib import suppress
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 from .config import settings
 
@@ -20,35 +21,78 @@ log = logging.getLogger(__name__)
 
 
 class MailClient:
-    """Долгоживущая MCP-сессия с автоматическим переподключением."""
+    """Долгоживущая MCP-сессия с автоматическим переподключением.
+
+    Транспорт stdio живёт внутри одной выделенной задачи: anyio требует,
+    чтобы вход и выход из его cancel scope произошли в одной и той же
+    задаче. Планировщик и обработчики кнопок работают в своих задачах,
+    поэтому открывать и закрывать сессию «по месту» нельзя — соединением
+    владеет _runner, остальные только вызывают инструменты.
+    """
 
     def __init__(self) -> None:
         self._session: ClientSession | None = None
-        self._stack: AsyncExitStack | None = None
         self._lock = asyncio.Lock()   # stdio-транспорт не выдерживает параллельных вызовов
+        self._task: asyncio.Task[None] | None = None
+        self._ready: asyncio.Event | None = None
+        self._stop: asyncio.Event | None = None
+        self._error: BaseException | None = None
 
     async def start(self) -> None:
         async with self._lock:
             await self._connect()
 
     async def _connect(self) -> None:
+        """Поднять задачу-владельца сессии и дождаться готовности."""
         await self._close()
-        stack = AsyncExitStack()
-        params = StdioServerParameters(command=settings.mcp_command, args=list(settings.mcp_args))
-        read, write = await stack.enter_async_context(stdio_client(params))
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        self._stack, self._session = stack, session
-        tools = await session.list_tools()
-        log.info("MCP подключён, инструментов: %d", len(tools.tools))
+        self._ready, self._stop, self._error = asyncio.Event(), asyncio.Event(), None
+        self._task = asyncio.create_task(self._runner(), name="mcp-email")
+        await self._ready.wait()
+        if self._session is None:
+            raise RuntimeError("не удалось подключиться к MCP") from self._error
+
+    async def _runner(self) -> None:
+        """Владеет транспортом: открывает, держит и закрывает его сам."""
+        assert self._ready is not None and self._stop is not None
+        try:
+            params = StdioServerParameters(
+                command=settings.mcp_command,
+                args=list(settings.mcp_args),
+                env=_server_env(),
+            )
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    log.info("MCP подключён, инструментов: %d", len(tools.tools))
+                    self._session = session
+                    self._ready.set()
+                    await self._stop.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - разбудить ожидающих и дать им ошибку
+            self._error = exc
+            log.error("MCP-сессия оборвалась", exc_info=True)
+        finally:
+            self._session = None
+            self._ready.set()
 
     async def _close(self) -> None:
-        if self._stack is not None:
-            try:
-                await self._stack.aclose()
-            except Exception:  # noqa: BLE001 - закрытие не должно мешать переподключению
-                log.warning("ошибка при закрытии MCP-сессии", exc_info=True)
-        self._stack = self._session = None
+        task, self._task = self._task, None
+        self._session = None
+        if task is None or task.done():
+            return
+        if self._stop is not None:
+            self._stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        except (TimeoutError, asyncio.TimeoutError):
+            log.warning("MCP-сессия не закрылась за 10 с, снимаю задачу")
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        except Exception:  # noqa: BLE001 - закрытие не должно мешать переподключению
+            log.warning("ошибка при закрытии MCP-сессии", exc_info=True)
 
     async def stop(self) -> None:
         async with self._lock:
@@ -57,12 +101,23 @@ class MailClient:
     async def call(self, tool: str, args: dict[str, Any]) -> Any:
         """Вызвать инструмент MCP. При обрыве stdio — одна попытка переподключения."""
         async with self._lock:
+            result = None
             for attempt in (1, 2):
                 if self._session is None:
                     await self._connect()
                 try:
-                    result = await self._session.call_tool(tool, args)  # type: ignore[union-attr]
+                    # Без таймаута подвисший IMAP держит блокировку вечно и
+                    # останавливает всего бота: поллинг и кнопки ждут её же.
+                    result = await asyncio.wait_for(
+                        self._session.call_tool(tool, args),  # type: ignore[union-attr]
+                        timeout=settings.mcp_timeout,
+                    )
                     break
+                except (TimeoutError, asyncio.TimeoutError):
+                    log.warning("MCP-вызов %s не ответил за %d с", tool, settings.mcp_timeout)
+                    await self._close()          # сессия подозрительная — поднимем заново
+                    if attempt == 2:
+                        raise
                 except Exception:  # noqa: BLE001 - транспорт мог умереть
                     if attempt == 2:
                         raise
@@ -83,8 +138,12 @@ class MailClient:
 
     # --- операции, которые нужны боту ---
 
-    async def list_new(self, since_uid: int) -> list[dict[str, Any]]:
-        """Метаданные писем в папке, новее указанного UID. Тела не тянем."""
+    async def list_new(self, since_uid: int) -> tuple[list[dict[str, Any]], int | None]:
+        """Метаданные писем новее указанного UID и верхний UID в папке.
+
+        Верхний UID возвращаем здесь же: он виден из того же ответа, а лишний
+        запрос метаданных на большом ящике стоит секунды.
+        """
         data = await self.call(
             "list_emails_metadata",
             {
@@ -96,14 +155,17 @@ class MailClient:
             },
         )
         items = _extract_list(data, ("emails", "items", "results", "data"))
-        fresh = []
+        fresh, top = [], None
         for it in items:
             uid = _to_int(it.get("email_id") or it.get("uid"))
-            if uid is not None and uid > since_uid:
+            if uid is None:
+                continue
+            top = uid if top is None else max(top, uid)
+            if uid > since_uid:
                 it["_uid"] = uid
                 fresh.append(it)
         fresh.sort(key=lambda x: x["_uid"])
-        return fresh
+        return fresh, top
 
     async def get_body(self, uid: int) -> dict[str, Any]:
         data = await self.call(
@@ -111,7 +173,7 @@ class MailClient:
             {
                 "account_name": settings.email_account,
                 "mailbox": settings.mailbox,
-                "email_ids": [uid],
+                "email_ids": [_eid(uid)],
                 "max_body_length": max(settings.body_chars_for_llm, settings.preview_chars) + 500,
                 "mark_as_read": False,
             },
@@ -145,7 +207,7 @@ class MailClient:
             "forward_email",
             {
                 "account_name": settings.email_account,
-                "email_id": uid,
+                "email_id": _eid(uid),
                 "source_mailbox": settings.mailbox,
                 "recipients": to,
                 "body": note,
@@ -159,7 +221,7 @@ class MailClient:
             {
                 "account_name": settings.email_account,
                 "mailbox": settings.mailbox,
-                "email_ids": [uid],
+                "email_ids": [_eid(uid)],
             },
         )
 
@@ -168,8 +230,8 @@ class MailClient:
             "archive_emails",
             {
                 "account_name": settings.email_account,
-                "source_mailbox": settings.mailbox,
-                "email_ids": [uid],
+                "mailbox": settings.mailbox,
+                "email_ids": [_eid(uid)],
             },
         )
 
@@ -179,9 +241,28 @@ class MailClient:
             {
                 "account_name": settings.email_account,
                 "mailbox": settings.mailbox,
-                "email_ids": [uid],
+                "email_ids": [_eid(uid)],
             },
         )
+
+
+def _server_env() -> dict[str, str]:
+    """Окружение для дочернего процесса MCP.
+
+    stdio_client по умолчанию пропускает только безопасный минимум (HOME, PATH),
+    поэтому настройки ящика (MCP_EMAIL_SERVER_*) нужно передать явно — иначе
+    сервер поднимается без аккаунта.
+    """
+    env = get_default_environment()
+    env.update(
+        {k: v for k, v in os.environ.items() if k.startswith("MCP_EMAIL_SERVER_")}
+    )
+    return env
+
+
+def _eid(uid: int) -> str:
+    """MCP ждёт email_id строкой (схема: pattern ^[1-9][0-9]*$)."""
+    return str(uid)
 
 
 def _as_text(result: Any) -> str:
