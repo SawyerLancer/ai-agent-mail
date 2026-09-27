@@ -1,0 +1,5 @@
+.env
+mcp-config/
+__pycache__/
+*.pyc
+.git/

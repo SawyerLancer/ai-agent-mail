@@ -1,0 +1,12 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Наружу открыт только вебхук: подпись проверяет приложение.
+	handle /webhook {
+		reverse_proxy bot:8000
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

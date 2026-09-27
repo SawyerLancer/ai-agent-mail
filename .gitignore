@@ -1,0 +1,7 @@
+.env
+mcp-config/
+data/
+__pycache__/
+*.py[cod]
+*.sqlite3
+.venv/
