@@ -29,13 +29,20 @@ def email_card(email: TrackedEmail, preview: str, summary: str, date: str = "") 
 
 
 def email_buttons(pk: int) -> list[list[dict[str, str]]]:
-    return [[
-        {"text": "✉️ Ответить", "data": f"{BTN_REPLY}:{pk}"},
-        {"text": "↪️ Переслать", "data": f"{BTN_FORWARD}:{pk}"},
-        {"text": "📄 Полностью", "data": f"{BTN_FULL}:{pk}"},
-        {"text": "📥 В архив", "data": f"{BTN_ARCHIVE}:{pk}"},
-        {"text": "🗑 Удалить", "data": f"{BTN_DELETE}:{pk}"},
-    ]]
+    # Ряд делится поровну между своими кнопками, а подпись не переносится:
+    # пять в ряду превращаются в «Уда…». Разбиваем по смыслу — работа с
+    # письмом отдельно, удаление из ящика отдельно.
+    return [
+        [
+            {"text": "✉️ Ответить", "data": f"{BTN_REPLY}:{pk}"},
+            {"text": "↪️ Переслать", "data": f"{BTN_FORWARD}:{pk}"},
+            {"text": "📄 Полностью", "data": f"{BTN_FULL}:{pk}"},
+        ],
+        [
+            {"text": "📥 В архив", "data": f"{BTN_ARCHIVE}:{pk}"},
+            {"text": "🗑 Удалить", "data": f"{BTN_DELETE}:{pk}"},
+        ],
+    ]
 
 
 def draft_card(draft: Draft) -> str:
