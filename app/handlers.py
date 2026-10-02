@@ -1,6 +1,7 @@
 """Обработка событий Пачки: нажатия кнопок и правки в тредах."""
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Any
 
@@ -57,6 +58,8 @@ async def handle_button(event: dict[str, Any]) -> None:
         await _send_draft(obj_id, chat_id, message_id)
     elif action == cards.BTN_REGEN:
         await _regen_draft(obj_id, chat_id, message_id)
+    elif action == cards.BTN_OWN:
+        await _ask_own_text(obj_id, message_id)
     elif action == cards.BTN_CANCEL:
         await _cancel(obj_id, chat_id, message_id)
     else:
@@ -79,7 +82,7 @@ async def handle_message(event: dict[str, Any]) -> None:
     with SessionLocal() as s:
         draft = s.scalar(
             select(Draft)
-            .where(Draft.thread_id == thread_id, Draft.status == "editing")
+            .where(Draft.thread_id == thread_id, Draft.status.in_(_OPEN))
             .order_by(Draft.id.desc())
         )
         if draft is None:
@@ -87,9 +90,25 @@ async def handle_message(event: dict[str, Any]) -> None:
         email = s.get(TrackedEmail, draft.email_pk)
         if email is None:
             return
-        draft_id, kind = draft.id, draft.kind
+        draft_id, kind, status = draft.id, draft.kind, draft.status
         current, subject, sender = draft.body, email.subject, email.sender
         old_preview = draft.preview_message_id
+
+    # «Свой текст»: сообщение и есть письмо — дословно, без модели и подписи.
+    if status == "awaiting_text":
+        content = str(event.get("content") or "")
+        with SessionLocal() as s:
+            draft = s.get(Draft, draft_id)
+            assert draft is not None
+            draft.body = content.strip("\n")
+            draft.status = "editing"
+            s.commit()
+            new_text, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
+        if old_preview:
+            await pachca.drop_buttons(old_preview, content="_Текст принят, черновик ниже._")
+        msg = await pachca.send_to_thread(thread_id, new_text, buttons)
+        _remember_preview(draft_id, msg.get("id"))
+        return
 
     # Для пересылки первая реплика в треде — это адрес получателя.
     if kind == "forward" and _looks_like_email(text):
@@ -342,6 +361,43 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
     _remember_preview(draft_id, msg.get("id"))
 
 
+async def _ask_own_text(draft_id: int, message_id: int) -> None:
+    with SessionLocal() as s:
+        draft = s.get(Draft, draft_id)
+        if draft is None or draft.status != "editing":
+            await pachca.drop_buttons(message_id, content="_Черновик уже неактуален._")
+            return
+        draft.status = "awaiting_text"
+        s.commit()
+        thread_id = draft.thread_id
+
+    text, buttons = cards.own_text_prompt(draft_id)
+    await pachca.drop_buttons(message_id, content="_Жду ваш текст ниже._")
+    msg = await pachca.send_to_thread(thread_id, text, buttons)
+    _remember_preview(draft_id, msg.get("id"))
+
+
+async def expire_drafts() -> int:
+    """Погасить черновики, которые не трогали дольше DRAFT_TTL_HOURS.
+
+    Иначе старая кнопка «Отправить» живёт вечно, а строки копятся в базе.
+    """
+    border = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=settings.draft_ttl_hours)
+    with SessionLocal() as s:
+        stale = s.scalars(
+            select(Draft).where(Draft.status.in_(_OPEN), Draft.updated_at < border)
+        ).all()
+        previews = [d.preview_message_id for d in stale if d.preview_message_id]
+        for d in stale:
+            d.status = "expired"
+        s.commit()
+    for message_id in previews:
+        await pachca.drop_buttons(
+            message_id, content="_Черновик устарел — нажмите «Ответить» заново._"
+        )
+    return len(stale)
+
+
 async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
     if draft_id:
         with SessionLocal() as s:
@@ -353,6 +409,9 @@ async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
 
 
 # --- вспомогательное ---
+
+# Черновики, с которыми ещё работают: их ищут правки и гасит срок жизни.
+_OPEN = ("editing", "awaiting_text")
 
 # Кнопки, которые живут на самой карточке письма (не на подтверждении удаления).
 _CARD_ACTIONS = {

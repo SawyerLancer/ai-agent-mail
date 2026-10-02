@@ -46,6 +46,14 @@ async def lifespan(app: FastAPI):
         coalesce=True,
         id="poll_mail",
     )
+    scheduler.add_job(
+        _expire_job,
+        "interval",
+        minutes=10,               # точность срока жизни черновика — 10 минут
+        max_instances=1,
+        coalesce=True,
+        id="expire_drafts",
+    )
     if settings.events_mode == "polling":
         scheduler.add_job(
             _events_job,
@@ -79,6 +87,15 @@ async def _poll_job() -> None:
             log.info("новых писем: %d", n)
     except Exception:  # noqa: BLE001 - джоба не должна умирать насовсем
         log.error("сбой в проходе поллинга", exc_info=True)
+
+
+async def _expire_job() -> None:
+    try:
+        n = await handlers.expire_drafts()
+        if n:
+            log.info("устаревших черновиков погашено: %d", n)
+    except Exception:  # noqa: BLE001 - джоба не должна умирать насовсем
+        log.error("сбой при уборке черновиков", exc_info=True)
 
 
 async def _events_job() -> None:

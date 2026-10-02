@@ -14,6 +14,7 @@ BTN_FULL = "mail:full"
 BTN_SEND = "draft:send"
 BTN_REGEN = "draft:regen"
 BTN_CANCEL = "draft:cancel"
+BTN_OWN = "draft:own"
 
 
 def email_card(email: TrackedEmail, preview: str, summary: str, date: str = "") -> str:
@@ -53,16 +54,31 @@ def draft_card(draft: Draft) -> str:
     return (
         f"{head}\n\n{draft.body}\n\n"
         "—\nНапишите в этот тред правку («короче», «добавь про сроки»), "
-        "и я перепишу. Или нажмите «Отправить»."
+        "и я перепишу. «Свой текст» — пришлёте письмо целиком, отправлю как есть. "
+        "Или нажмите «Отправить»."
     )
 
 
 def draft_buttons(draft_id: int) -> list[list[dict[str, str]]]:
-    return [[
-        {"text": "📨 Отправить", "data": f"{BTN_SEND}:{draft_id}"},
-        {"text": "🔄 Заново", "data": f"{BTN_REGEN}:{draft_id}"},
-        {"text": "✖️ Отмена", "data": f"{BTN_CANCEL}:{draft_id}"},
-    ]]
+    # Четыре кнопки в ряд обрезают подписи — два ряда.
+    return [
+        [
+            {"text": "📨 Отправить", "data": f"{BTN_SEND}:{draft_id}"},
+            {"text": "✍️ Свой текст", "data": f"{BTN_OWN}:{draft_id}"},
+        ],
+        [
+            {"text": "🔄 Заново", "data": f"{BTN_REGEN}:{draft_id}"},
+            {"text": "✖️ Отмена", "data": f"{BTN_CANCEL}:{draft_id}"},
+        ],
+    ]
+
+
+def own_text_prompt(draft_id: int) -> tuple[str, list[list[dict[str, str]]]]:
+    text = (
+        "Пришлите текст письма целиком следующим сообщением — "
+        "отправлю как есть, без правок модели и без подписи."
+    )
+    return text, [[{"text": "✖️ Отмена", "data": f"{BTN_CANCEL}:{draft_id}"}]]
 
 
 def delete_confirm(email: TrackedEmail) -> tuple[str, list[list[dict[str, str]]]]:

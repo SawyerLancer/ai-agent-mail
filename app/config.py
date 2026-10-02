@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     mcp_timeout: int = 120                   # с; зависший вызов MCP иначе встаёт навсегда
     preview_chars: int = 700                 # сколько текста письма показывать в чате
     body_chars_for_llm: int = 6000           # сколько отдаём модели
+    draft_ttl_hours: int = 48                # незакрытый черновик гаснет через столько часов
 
     # --- Прочее ---
     db_path: str = "/data/bot.sqlite3"

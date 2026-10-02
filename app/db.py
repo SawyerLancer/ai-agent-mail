@@ -66,12 +66,16 @@ class Draft(Base):
     email_pk: Mapped[int] = mapped_column(Integer, index=True)
     thread_id: Mapped[int] = mapped_column(BigInteger, index=True)
     kind: Mapped[str] = mapped_column(String(16))       # reply | forward
-    status: Mapped[str] = mapped_column(String(16), default="editing")  # editing|sent|cancelled
+    # editing | awaiting_text (ждём «свой текст») | sent | cancelled | expired
+    status: Mapped[str] = mapped_column(String(16), default="editing")
     body: Mapped[str] = mapped_column(Text, default="")
     recipients: Mapped[str] = mapped_column(Text, default="")  # для forward, через запятую
     # последнее сообщение бота с превью — чтобы гасить у него кнопки
     preview_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # от последней правки, а не от создания, отсчитывается срок жизни черновика
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 class SeenEvent(Base):
