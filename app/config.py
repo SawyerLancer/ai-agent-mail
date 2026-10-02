@@ -1,6 +1,7 @@
 """Конфигурация из переменных окружения."""
 from __future__ import annotations
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +46,15 @@ class Settings(BaseSettings):
     preview_chars: int = 700                 # сколько текста письма показывать в чате
     body_chars_for_llm: int = 6000           # сколько отдаём модели
     draft_ttl_hours: int = 48                # незакрытый черновик гаснет через столько часов
+    # Владелец профиля стиля. Пока бот у одного человека — это адрес ящика.
+    owner_email: str = Field(
+        "", validation_alias=AliasChoices("OWNER_EMAIL", "MCP_EMAIL_SERVER_EMAIL_ADDRESS")
+    )
+
+    # --- Память стиля ---
+    style_activate_hits: int = 2             # столько подтверждений — и правило в деле
+    style_max_global: int = 15               # активных общих правил
+    style_max_per_recipient: int = 5         # активных правил на одного адресата
 
     # --- Прочее ---
     db_path: str = "/data/bot.sqlite3"

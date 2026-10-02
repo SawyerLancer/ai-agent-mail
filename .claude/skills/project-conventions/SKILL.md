@@ -19,10 +19,13 @@ description: Структура репозитория, локальный за�
 | `app/pachca.py` | клиент Пачки → `pachca-api` |
 | `app/mail.py` | MCP-клиент почты → `mail-mcp` |
 | `app/llm.py` | LLM → `llm-providers` |
-| `app/db.py` | SQLAlchemy-модели и SQLite |
+| `app/db.py` | SQLAlchemy-модели, SQLite, мини-миграция колонок |
+| `app/factcheck.py` | что модель добавила от себя → `draft-review-flow` |
+| `app/proofdiff.py` | «было → стало» для вычитки → `draft-review-flow` |
+| `app/style.py` | память стиля → `style-memory` |
 
-Миграций нет: `Base.metadata.create_all` при старте. Новая колонка в существующей
-таблице сама не появится.
+`init_db()` при старте: `create_all` для новых таблиц + `_add_missing_columns()`
+для новых колонок в существующих.
 
 ### Локальный запуск
 Рекомендованный путь — Docker (`deploy-vps`) с `EVENTS_MODE=polling`: публичный
@@ -33,6 +36,16 @@ pip install -r requirements.txt
 DB_PATH=./data/bot.sqlite3 uvicorn app.main:app --port 8000
 ```
 `./data/` создать заранее (в `.gitignore`).
+
+### Тесты
+`tests/` (pytest, `requirements-dev.txt`). Чистые модули (`factcheck`,
+`proofdiff`) — без заглушек; БД — настоящая SQLite во временной папке
+(`tests/conftest.py`); Пачка, почта и модель — подставные объекты
+(`tests/test_draft_flow.py`). Сеть в тестах не трогаем. Запуск в образе бота
+(Python 3.12, закреплённые версии):
+```bash
+docker compose run --rm --no-deps -v "$PWD/tests:/srv/tests:ro" bot sh -c "pip install --user -q pytest==9.1.1 && python -m pytest -q -p no:cacheprovider tests"
+```
 
 ### Стиль кода
 - Python 3.12, `from __future__ import annotations`, аннотации везде,
@@ -56,8 +69,6 @@ DB_PATH=./data/bot.sqlite3 uvicorn app.main:app --port 8000
 - Задачи — GitHub issues.
 
 ## Требования и расхождения
-- Нет тестов, линтера, форматтера и `pyproject.toml`; проверка — запуск на живом
-  ящике и в чате.
-- Нет миграций схемы БД — изменение моделей ломает существующие базы
-  (касается плана `draft-review-flow`: `awaiting_text`/`expired` не требуют
-  колонок, а вот новые поля потребуют).
+- Нет линтера, форматтера и `pyproject.toml`.
+- Миграции — только `db._add_missing_columns()`: добавить колонку со скалярным
+  default. Переименование или смена типа — уже нужен Alembic.

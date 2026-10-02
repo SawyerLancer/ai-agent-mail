@@ -19,9 +19,13 @@ class LLM(ABC):
 
 | Функция | Где | Что |
 |---|---|---|
-| `draft_reply(sender, subject, body, instruction=None)` | «Ответить», «Заново» | черновик + подпись |
-| `revise(current, instruction, sender, subject)` | сообщение в треде | новый текст черновика + подпись |
+| `draft_reply(sender, subject, body, instruction=None, style_rules=())` | «Ответить», «Заново» | черновик + подпись |
+| `revise(current, instruction, sender, subject, style_rules=())` | сообщение в треде | новый текст черновика + подпись |
 | `summarize(sender, subject, body)` | карточка письма | 1–2 предложения; при ошибке `""` |
+| `proofread(text)` | «Свой текст» | только ошибки; свой `PROOFREAD_SYSTEM`; без стиля и подписи; пусто → исключение |
+| `extract_style(user_texts, edits, existing)` | после отправки | сырой JSON операций для `style.parse_ops` (`style-memory`) |
+
+Блок стиля собирает `_style_block`.
 
 ### Провайдеры
 | `LLM_PROVIDER` | Класс | SDK | Модель по умолчанию |
@@ -41,6 +45,8 @@ class LLM(ABC):
 
 ### Tool calling
 Не используется ни у одного провайдера — намеренно. Модель возвращает только текст.
+Где нужна структура (`extract_style`), просим JSON-массив текстом и разбираем
+устойчиво: вырезаем `[...]`, мусор → пустой результат.
 
 ### Ошибки
 Фоллбека нет. Исключение провайдера ловит вызывающий код в `handlers.py`

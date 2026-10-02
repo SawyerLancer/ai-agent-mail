@@ -1,13 +1,16 @@
 """Обработка событий Пачки: нажатия кнопок и правки в тредах."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import json
 import logging
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from . import cards, llm
+from . import cards, factcheck, llm, proofdiff, style
 from .config import settings
 from .db import Draft, SessionLocal, TrackedEmail
 from .mail import mail
@@ -60,6 +63,8 @@ async def handle_button(event: dict[str, Any]) -> None:
         await _regen_draft(obj_id, chat_id, message_id)
     elif action == cards.BTN_OWN:
         await _ask_own_text(obj_id, message_id)
+    elif action == cards.BTN_RAW:
+        await _use_raw(obj_id, message_id)
     elif action == cards.BTN_CANCEL:
         await _cancel(obj_id, chat_id, message_id)
     else:
@@ -67,17 +72,28 @@ async def handle_button(event: dict[str, Any]) -> None:
 
 
 async def handle_message(event: dict[str, Any]) -> None:
-    """Сообщение пользователя. В треде письма = правка черновика."""
-    if event.get("entity_type") != "thread":
-        return
+    """Сообщение пользователя. «/стиль …» — команда памяти стиля (в треде и
+    в чате); любое другое сообщение в треде письма — правка черновика."""
     user_id = int(event.get("user_id") or 0)
     if not user_allowed(user_id):
         return
-
-    thread_id = int(event.get("entity_id") or 0)   # entity_id треда = его id
     text = str(event.get("content") or "").strip()
     if not text:
         return
+
+    entity_type = str(event.get("entity_type") or "")
+    entity_id = int(event.get("entity_id") or 0)
+    if style.is_command(text):
+        reply = style.handle_command(text, owner_id=_owner_id())
+        if entity_type == "thread":
+            await pachca.send_to_thread(entity_id, reply)
+        else:
+            await pachca.send_message(entity_id=entity_id, entity_type=entity_type or "discussion", content=reply)
+        return
+
+    if entity_type != "thread":
+        return
+    thread_id = entity_id   # entity_id треда = его id
 
     with SessionLocal() as s:
         draft = s.scalar(
@@ -94,20 +110,9 @@ async def handle_message(event: dict[str, Any]) -> None:
         current, subject, sender = draft.body, email.subject, email.sender
         old_preview = draft.preview_message_id
 
-    # «Свой текст»: сообщение и есть письмо — дословно, без модели и подписи.
+    # «Свой текст»: модель исправляет только ошибки, без стиля и подписи.
     if status == "awaiting_text":
-        content = str(event.get("content") or "")
-        with SessionLocal() as s:
-            draft = s.get(Draft, draft_id)
-            assert draft is not None
-            draft.body = content.strip("\n")
-            draft.status = "editing"
-            s.commit()
-            new_text, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
-        if old_preview:
-            await pachca.drop_buttons(old_preview, content="_Текст принят, черновик ниже._")
-        msg = await pachca.send_to_thread(thread_id, new_text, buttons)
-        _remember_preview(draft_id, msg.get("id"))
+        await _proofread_own(draft_id, thread_id, str(event.get("content") or "").strip("\n"), old_preview)
         return
 
     # Для пересылки первая реплика в треде — это адрес получателя.
@@ -124,9 +129,11 @@ async def handle_message(event: dict[str, Any]) -> None:
         _remember_preview(draft_id, msg.get("id"))
         return
 
+    recipient = _address_of(sender) if kind == "reply" else ""
     try:
         revised = await llm.revise(
-            current=current, instruction=text, sender=sender, subject=subject
+            current=current, instruction=text, sender=sender, subject=subject,
+            style_rules=_style_rules(recipient),
         )
     except Exception:  # noqa: BLE001 - ошибку модели показываем человеку
         log.error("LLM не смог переписать черновик", exc_info=True)
@@ -138,7 +145,8 @@ async def handle_message(event: dict[str, Any]) -> None:
     with SessionLocal() as s:
         draft = s.get(Draft, draft_id)
         assert draft is not None
-        draft.body = revised
+        _add_user_text(draft, text)
+        _set_body(s, draft, revised)
         s.commit()
         new_text, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
 
@@ -173,7 +181,10 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
 
     body = await _body_of(email)
     try:
-        text = await llm.draft_reply(sender=email.sender, subject=email.subject, body=body)
+        text = await llm.draft_reply(
+            sender=email.sender, subject=email.subject, body=body,
+            style_rules=_style_rules(_address_of(email.sender)),
+        )
     except Exception:  # noqa: BLE001
         log.error("LLM не смог составить черновик", exc_info=True)
         await pachca.send_to_thread(
@@ -183,9 +194,11 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
 
     with SessionLocal() as s:
         draft = Draft(
-            email_pk=email_pk, thread_id=thread_id, kind="reply", body=text
+            email_pk=email_pk, thread_id=thread_id, kind="reply",
+            source_text=body[: settings.body_chars_for_llm], first_ai_body=text,
         )
         s.add(draft)
+        _set_body(s, draft, text)
         s.commit()
         card, buttons = cards.draft_card(draft), cards.draft_buttons(draft.id)
         draft_id = draft.id
@@ -323,7 +336,17 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         if draft is not None:
             draft.status = "sent"
             s.commit()
+            learn_from = (_user_texts(draft), draft.first_ai_body)
     await pachca.drop_buttons(message_id, content=f"{done}\n\n{body}")
+
+    # Память стиля — в фоне: ответ в чате не ждёт модель, ошибка не мешает.
+    # Пересылки не учим: комментарий к ним слишком короткий.
+    if kind == "reply" and draft is not None:
+        user_texts, first_ai = learn_from
+        _background(style.learn(
+            owner_id=_owner_id(), recipient=_address_of(sender),
+            user_texts=user_texts, first_ai_body=first_ai, sent_body=body,
+        ))
 
 
 async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
@@ -334,15 +357,17 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         email = s.get(TrackedEmail, draft.email_pk)
         if email is None:
             return
-        thread_id = draft.thread_id
+        thread_id, source = draft.thread_id, draft.source_text
 
-    body = await _body_of(email)
+    # Тело уже сохранено при «Ответить»; заново из ящика — только у старых черновиков.
+    body = source or await _body_of(email)
     try:
         text = await llm.draft_reply(
             sender=email.sender,
             subject=email.subject,
             body=body,
             instruction="Предложи другой вариант: иная структура и формулировки.",
+            style_rules=_style_rules(_address_of(email.sender)),
         )
     except Exception:  # noqa: BLE001
         log.error("LLM не смог перегенерировать черновик", exc_info=True)
@@ -352,7 +377,10 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
     with SessionLocal() as s:
         draft = s.get(Draft, draft_id)
         assert draft is not None
-        draft.body = text
+        if not draft.source_text:
+            draft.source_text = body[: settings.body_chars_for_llm]
+        draft.first_ai_body = text      # новая точка отсчёта для правок человека
+        _set_body(s, draft, text)
         s.commit()
         card, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
 
@@ -374,6 +402,58 @@ async def _ask_own_text(draft_id: int, message_id: int) -> None:
     text, buttons = cards.own_text_prompt(draft_id)
     await pachca.drop_buttons(message_id, content="_Жду ваш текст ниже._")
     msg = await pachca.send_to_thread(thread_id, text, buttons)
+    _remember_preview(draft_id, msg.get("id"))
+
+
+async def _proofread_own(draft_id: int, thread_id: int, original: str, old_preview: int | None) -> None:
+    """«Свой текст» → вычитка. Профиль стиля и подпись не применяются."""
+    with SessionLocal() as s:
+        draft = s.get(Draft, draft_id)
+        assert draft is not None
+        draft.original_text = original
+        _add_user_text(draft, original)
+        s.commit()
+    if old_preview:
+        await pachca.drop_buttons(old_preview, content="_Текст получил, проверяю ошибки…_")
+
+    failed = False
+    try:
+        fixed = await llm.proofread(original)
+    except Exception:  # noqa: BLE001 - без вычитки текст всё равно можно отправить
+        log.error("LLM не смог вычитать текст", exc_info=True)
+        fixed, failed = original, True
+
+    diff = proofdiff.compare(original, fixed)
+    with SessionLocal() as s:
+        draft = s.get(Draft, draft_id)
+        assert draft is not None
+        _set_body(s, draft, fixed)
+        draft.original_text = original    # _set_body сбрасывает — здесь он нужен
+        draft.status = "editing"
+        s.commit()
+        card = cards.draft_card(draft, proof=None if failed else diff, proof_failed=failed)
+        buttons = cards.draft_buttons(draft_id, raw=fixed != original)
+
+    msg = await pachca.send_to_thread(thread_id, card, buttons)
+    _remember_preview(draft_id, msg.get("id"))
+
+
+async def _use_raw(draft_id: int, message_id: int) -> None:
+    """«Без правок»: вернуть дословный текст пользователя."""
+    with SessionLocal() as s:
+        draft = s.get(Draft, draft_id)
+        if draft is None or draft.status != "editing" or not draft.original_text:
+            await pachca.drop_buttons(message_id, content="_Черновик уже неактуален._")
+            return
+        original = draft.original_text
+        _set_body(s, draft, original)
+        draft.original_text = original
+        s.commit()
+        thread_id = draft.thread_id
+        card = cards.draft_card(draft)
+
+    await pachca.drop_buttons(message_id, content="_Вернул ваш текст без правок — ниже._")
+    msg = await pachca.send_to_thread(thread_id, card, cards.draft_buttons(draft_id))
     _remember_preview(draft_id, msg.get("id"))
 
 
@@ -412,6 +492,55 @@ async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
 
 # Черновики, с которыми ещё работают: их ищут правки и гасит срок жизни.
 _OPEN = ("editing", "awaiting_text")
+
+_bg_tasks: set[asyncio.Task[None]] = set()   # держим ссылки, иначе GC снимет задачу
+
+
+def _background(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def _owner_id() -> str:
+    """Владелец профиля стиля. Пока бот у одного человека — адрес ящика."""
+    return (settings.owner_email or settings.email_account).strip().lower()
+
+
+def _style_rules(recipient: str) -> list[str]:
+    try:
+        with SessionLocal() as s:
+            return style.active_rules(s, owner_id=_owner_id(), recipient=recipient)
+    except Exception:  # noqa: BLE001 - без стиля черновик всё равно нужен
+        log.warning("не удалось прочитать профиль стиля", exc_info=True)
+        return []
+
+
+def _user_texts(draft: Draft) -> list[str]:
+    try:
+        items = json.loads(draft.user_texts or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [str(x) for x in items] if isinstance(items, list) else []
+
+
+def _add_user_text(draft: Draft, text: str) -> None:
+    draft.user_texts = json.dumps(_user_texts(draft) + [text], ensure_ascii=False)
+
+
+def _set_body(s: Session, draft: Draft, body: str) -> None:
+    """Новое тело черновика + проверка, не добавила ли модель фактов.
+
+    Источники — письмо и тексты пользователя, а не прошлый черновик: иначе
+    выдуманная однажды сумма после правки перестала бы помечаться.
+    """
+    draft.body = body
+    draft.original_text = ""      # «Без правок» имеет смысл только сразу после вычитки
+    email = s.get(TrackedEmail, draft.email_pk)
+    sources = [draft.source_text, *_user_texts(draft), settings.signature]
+    if email is not None:
+        sources += [email.subject, email.sender]
+    draft.added_facts = json.dumps(factcheck.added(body, sources), ensure_ascii=False)
 
 # Кнопки, которые живут на самой карточке письма (не на подтверждении удаления).
 _CARD_ACTIONS = {

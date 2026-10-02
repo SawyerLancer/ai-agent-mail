@@ -5,7 +5,8 @@ import datetime as dt
 from typing import Optional
 
 from sqlalchemy import (
-    BigInteger, DateTime, Integer, String, Text, UniqueConstraint, create_engine, select,
+    BigInteger, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect,
+    select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -76,6 +77,43 @@ class Draft(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+    # «Свой текст» дословно — для кнопки «Без правок»; пусто, если тело от модели
+    original_text: Mapped[str] = mapped_column(Text, default="")
+    # первый вариант ИИ: разница с отправленным — материал для памяти стиля
+    first_ai_body: Mapped[str] = mapped_column(Text, default="")
+    # тело входящего письма (обрезанное) — источник для проверки фактов.
+    # В обучение стилю не передаётся никогда: это недоверенный текст.
+    source_text: Mapped[str] = mapped_column(Text, default="")
+    # JSON-список текстов пользователя: правки из треда и «Свой текст»
+    user_texts: Mapped[str] = mapped_column(Text, default="[]")
+    # JSON-список того, что модель добавила от себя (для «⚠️» в превью)
+    added_facts: Mapped[str] = mapped_column(Text, default="[]")
+
+
+class StyleRule(Base):
+    """Правило стиля пользователя: как он пишет, а не о чём.
+
+    owner_id — владелец профиля (сейчас адрес ящика). Везде передаётся явно,
+    чтобы потом развести профили нескольких людей без переделки.
+    """
+    __tablename__ = "style_rule"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(320), index=True)
+    scope: Mapped[str] = mapped_column(String(16))              # global | recipient
+    recipient: Mapped[str] = mapped_column(String(320), default="")
+    text: Mapped[str] = mapped_column(Text)
+    norm_text: Mapped[str] = mapped_column(String(255))         # для отсева точных дублей
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="candidate")  # candidate | active
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "scope", "recipient", "norm_text", name="uq_style_rule"),
+    )
 
 
 class SeenEvent(Base):
@@ -92,6 +130,33 @@ SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
 
 def init_db() -> None:
     Base.metadata.create_all(_engine)
+    _add_missing_columns()
+
+
+def _add_missing_columns() -> None:
+    """Мини-миграция: create_all не добавляет колонки в существующие таблицы.
+
+    Только добавление столбцов с простым значением по умолчанию — для
+    переименований и смены типов этого мало, тогда пора брать Alembic.
+    """
+    insp = inspect(_engine)
+    with _engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                ddl = f"ALTER TABLE {table.name} ADD COLUMN {col.name} " + col.type.compile(
+                    dialect=_engine.dialect
+                )
+                default = col.default.arg if col.default is not None and col.default.is_scalar else None
+                if isinstance(default, str):
+                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+                elif isinstance(default, int):
+                    ddl += f" DEFAULT {default}"
+                conn.exec_driver_sql(ddl)
 
 
 def already_seen(s: Session, key: str) -> bool:
