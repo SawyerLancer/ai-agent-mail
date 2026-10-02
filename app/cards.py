@@ -68,7 +68,7 @@ def draft_buttons(draft_id: int) -> list[list[dict[str, str]]]:
 def delete_confirm(email: TrackedEmail) -> tuple[str, list[list[dict[str, str]]]]:
     text = (
         f"Удалить письмо «{email.subject or '(без темы)'}» от {email.sender}?\n"
-        "Это необратимо — письмо исчезнет из ящика."
+        "Письмо будет перемещено в «Удалённые» — оттуда его можно вернуть."
     )
     buttons = [[
         {"text": "🗑 Да, удалить", "data": f"{BTN_DELETE_OK}:{email.id}"},

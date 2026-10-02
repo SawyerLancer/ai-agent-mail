@@ -38,6 +38,9 @@ async def handle_button(event: dict[str, Any]) -> None:
         log.warning("непонятная кнопка: %s", data)
         return
 
+    if action in _CARD_ACTIONS and message_id:
+        _backfill_card_id(obj_id, message_id)
+
     if action == cards.BTN_REPLY:
         await _start_reply(obj_id, chat_id)
     elif action == cards.BTN_FORWARD:
@@ -246,7 +249,7 @@ async def _do_delete(email_pk: int, chat_id: int, message_id: int) -> None:
         log.error("не удалось удалить uid=%s", uid, exc_info=True)
         await pachca.drop_buttons(message_id, content="Не удалось удалить письмо.")
         return
-    await pachca.drop_buttons(message_id, content=f"🗑 Письмо «{subject}» удалено.")
+    await pachca.drop_buttons(message_id, content=f"🗑 Письмо «{subject}» перемещено в «Удалённые».")
     if card_id:
         await pachca.drop_buttons(card_id, content=f"🗑 _Удалено:_ {subject or '(без темы)'}")
 
@@ -350,6 +353,25 @@ async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
 
 
 # --- вспомогательное ---
+
+# Кнопки, которые живут на самой карточке письма (не на подтверждении удаления).
+_CARD_ACTIONS = {
+    cards.BTN_REPLY, cards.BTN_FORWARD, cards.BTN_FULL, cards.BTN_ARCHIVE, cards.BTN_DELETE,
+}
+
+
+def _backfill_card_id(email_pk: int, message_id: int) -> None:
+    """Дописать id карточки, если поллер упал между отправкой и commit.
+
+    Карточка тогда уже в чате, а запись без pachca_message_id: тред под ней
+    не создать. Нажатая кнопка карточки сама говорит, где она.
+    """
+    with SessionLocal() as s:
+        email = s.get(TrackedEmail, email_pk)
+        if email is not None and not email.pachca_message_id:
+            email.pachca_message_id = message_id
+            s.commit()
+            log.info("письму %s восстановлен id карточки %s", email_pk, message_id)
 
 async def _body_of(email: TrackedEmail) -> str:
     try:

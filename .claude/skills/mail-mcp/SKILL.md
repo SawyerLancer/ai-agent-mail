@@ -28,17 +28,17 @@ description: Работа с почтой через open-source MCP-серве�
 
 | Метод `mail.*` | Инструмент MCP | Аргументы |
 |---|---|---|
-| `list_new(since_uid)` | `list_emails_metadata` | `account_name, mailbox, page=1, page_size=POLL_PAGE_SIZE, order="desc"` |
+| `list_new(since_uid)` | `list_emails_metadata` | `account_name, mailbox, page, page_size=POLL_PAGE_SIZE, order="desc"` — листает, пока страница целиком новая (до 20) |
 | `get_body(uid)` | `get_emails_content` | `account_name, mailbox, email_ids=[id], max_body_length, mark_as_read=False` |
 | `send(...)` | `send_email` | `account_name, recipients, subject, body, in_reply_to?, references?` |
 | `forward(...)` | `forward_email` | `account_name, email_id, source_mailbox, recipients, body, include_attachments=True` |
-| `delete(uid)` | `delete_emails` | `account_name, mailbox, email_ids` — **UID EXPUNGE, безвозвратно** |
+| `delete(uid)` | `move_emails` | `account_name, email_ids, source_mailbox, destination_mailbox=<\Trash>` |
+| `_trash_mailbox()` | `list_mailboxes` | `account_name` → папка с флагом `\Trash`, кэш |
 | `archive(uid)` | `archive_emails` | `account_name, mailbox, email_ids` — папка по флагу `\Archive` |
 | `mark_read(uid)` | `mark_emails_as_read` | `account_name, mailbox, email_ids` |
 
-Есть в сервере, но бот пока не вызывает: `move_emails(account_name, email_ids,
-destination_mailbox, source_mailbox="INBOX")`, `list_mailboxes(account_name,
-pattern="*")` (имена папок и флаги), `set_email_flags`, `save_to_mailbox`,
+Есть в сервере, но бот не вызывает: `delete_emails` (UID EXPUNGE —
+безвозвратно, не использовать), `set_email_flags`, `save_to_mailbox`,
 `download_attachment`, `list_available_accounts`.
 
 Кодировки заголовков, MIME, вложения и сохранение в «Отправленные» делает сервер —
@@ -72,4 +72,3 @@ data = await mail.call("list_mailboxes", {"account_name": settings.email_account
 - Новая операция — новым методом `MailClient`, а не прямым `mail.call` из хендлеров.
 - Повтор при обрыве небезопасен для мутаций: `send_email` после таймаута может уйти
   дважды. Сейчас это так и есть — учитывай при изменениях.
-- Удаление в корзину вместо EXPUNGE — см. `email-actions-safety`, «Расхождения».

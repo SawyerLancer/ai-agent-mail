@@ -19,6 +19,9 @@ from .config import settings
 
 log = logging.getLogger(__name__)
 
+# Предохранитель от листания всего ящика: 20 × POLL_PAGE_SIZE писем за проход.
+_MAX_POLL_PAGES = 20
+
 
 class MailClient:
     """Долгоживущая MCP-сессия с автоматическим переподключением.
@@ -37,6 +40,7 @@ class MailClient:
         self._ready: asyncio.Event | None = None
         self._stop: asyncio.Event | None = None
         self._error: BaseException | None = None
+        self._trash: str | None = None   # имя корзины, ищется один раз
 
     async def start(self) -> None:
         async with self._lock:
@@ -143,27 +147,42 @@ class MailClient:
 
         Верхний UID возвращаем здесь же: он виден из того же ответа, а лишний
         запрос метаданных на большом ящике стоит секунды.
+
+        Листаем страницы, пока на них только новые письма: иначе всплеск больше
+        page_size терял бы старшие письма, а точка отсчёта уезжала бы за них.
+        На первом запуске (since_uid=0) нужен лишь верхний UID — одна страница.
         """
-        data = await self.call(
-            "list_emails_metadata",
-            {
-                "account_name": settings.email_account,
-                "mailbox": settings.mailbox,
-                "page": 1,
-                "page_size": settings.poll_page_size,
-                "order": "desc",
-            },
-        )
-        items = _extract_list(data, ("emails", "items", "results", "data"))
         fresh, top = [], None
-        for it in items:
-            uid = _to_int(it.get("email_id") or it.get("uid"))
-            if uid is None:
-                continue
-            top = uid if top is None else max(top, uid)
-            if uid > since_uid:
-                it["_uid"] = uid
-                fresh.append(it)
+        for page in range(1, _MAX_POLL_PAGES + 1):
+            data = await self.call(
+                "list_emails_metadata",
+                {
+                    "account_name": settings.email_account,
+                    "mailbox": settings.mailbox,
+                    "page": page,
+                    "page_size": settings.poll_page_size,
+                    "order": "desc",
+                },
+            )
+            items = _extract_list(data, ("emails", "items", "results", "data"))
+            reached_old = False
+            for it in items:
+                uid = _to_int(it.get("email_id") or it.get("uid"))
+                if uid is None:
+                    continue
+                top = uid if top is None else max(top, uid)
+                if uid > since_uid:
+                    it["_uid"] = uid
+                    fresh.append(it)
+                else:
+                    reached_old = True
+            if reached_old or since_uid == 0 or len(items) < settings.poll_page_size:
+                break
+        else:
+            log.warning(
+                "новых писем больше %d страниц: более старые из них пропущены",
+                _MAX_POLL_PAGES,
+            )
         fresh.sort(key=lambda x: x["_uid"])
         return fresh, top
 
@@ -216,14 +235,35 @@ class MailClient:
         )
 
     async def delete(self, uid: int) -> Any:
+        """Переместить письмо в корзину ящика.
+
+        Не delete_emails: тот делает UID EXPUNGE, и письмо пропадает мимо
+        «Удалённых» безвозвратно.
+        """
         return await self.call(
-            "delete_emails",
+            "move_emails",
             {
                 "account_name": settings.email_account,
-                "mailbox": settings.mailbox,
                 "email_ids": [_eid(uid)],
+                "source_mailbox": settings.mailbox,
+                "destination_mailbox": await self._trash_mailbox(),
             },
         )
+
+    async def _trash_mailbox(self) -> str:
+        """Корзина по флагу \\Trash (RFC 6154), а не по имени: у провайдеров
+        оно разное и бывает локализованным. Нет флага — ошибка, а не EXPUNGE."""
+        if self._trash is None:
+            data = await self.call("list_mailboxes", {"account_name": settings.email_account})
+            boxes = _extract_list(data, ("mailboxes", "items", "results", "data"))
+            for box in boxes:
+                flags = {str(f).lower() for f in box.get("flags") or []}
+                if "\\trash" in flags:
+                    self._trash = str(box.get("name") or "") or None
+                    break
+            if not self._trash:
+                raise RuntimeError("в ящике не найдена папка с флагом \\Trash")
+        return self._trash
 
     async def archive(self, uid: int) -> Any:
         return await self.call(
