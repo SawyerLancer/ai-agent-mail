@@ -63,6 +63,10 @@ _Источник: …/mail-clients/mail-clients-troubleshooting, провере
 (skill `mail-mcp`) — смотри флаги RFC 6154 (`\Sent`, `\Trash`, `\Junk`,
 `\Drafts`), а не имя.
 
+_Проверено на живом ящике 2026-10-02:_ корзина Яндекса помечена `\Trash` —
+удаление через `move_emails` (skill `email-actions-safety`) кладёт письмо в
+«Удалённые».
+
 ## Ошибки входа и отправки
 _Источник: …/mail-clients/mail-clients-troubleshooting, проверено 2026-10-02._
 
@@ -80,5 +84,3 @@ _Источник: …/mail-clients/mail-clients-troubleshooting, провере
 
 ## Требования и расхождения
 - В коде бота не должно быть ничего специфичного для Яндекса — только `.env`.
-- Имя корзины для будущего «удаления в корзину» не хардкодить — определять по флагу
-  `\Trash` (см. `email-actions-safety`).
