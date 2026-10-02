@@ -27,6 +27,9 @@ class MailToolError(RuntimeError):
     """
 
 
+# Сколько последних писем «Отправленных» просматривает find_sent.
+_SENT_LOOKBACK = 20
+
 # Предохранитель от листания всего ящика: 20 × POLL_PAGE_SIZE писем за проход.
 _MAX_POLL_PAGES = 20
 
@@ -279,28 +282,37 @@ class MailClient:
                 raise RuntimeError(f"в ящике не найдена папка с флагом {flag}")
         return self._special[flag]
 
-    async def find_sent(self, *, to: str, since: dt.datetime, subject: str | None = None) -> bool:
-        """Есть ли в «Отправленных» письмо этому адресату не раньше since.
+    async def find_sent(self, *, to: str, since: dt.datetime, subject: str) -> bool:
+        """Есть ли в «Отправленных» наше письмо: этому адресату, с этой темой,
+        не раньше since.
 
         Свой Message-ID задать нельзя (send_email не принимает заголовки),
-        поэтому ищем по адресату, времени и, для ответа, теме. Если сервер
-        отправил письмо, но не успел сохранить копию, — не найдём.
+        поэтому сверяем адресата, время и тему. Серверные фильтры не берём —
+        проверено на Яндексе (skill mail-mcp): since в mcp-email-server 1.6.2
+        пишет месяц заглавными («01-OCT-2026»), и Яндекс отвечает BAD;
+        to_address с полным адресом находит 0 писем. Поэтому читаем последние
+        письма папки (новые сверху) и фильтруем сами. Письмо без разбираемой
+        даты не считаем найденным. Если сервер отправил письмо, но не успел
+        сохранить копию, — не найдём.
         """
         data = await self.call(
             "list_emails_metadata",
             {
                 "account_name": settings.email_account,
                 "mailbox": await self._special_mailbox("\\sent"),
-                "to_address": to,
-                "since": since.isoformat(),
                 "page": 1,
-                "page_size": 10,
+                "page_size": _SENT_LOOKBACK,
                 "order": "desc",
             },
         )
-        want = _norm_subject(subject) if subject is not None else None
+        want_to, want_subject = to.strip().lower(), _norm_subject(subject)
         for it in _extract_list(data, ("emails", "items", "results", "data")):
-            if want is None or _norm_subject(str(it.get("subject") or "")) == want:
+            when = _parse_dt(it.get("date"))
+            if when is None or when < since:
+                continue
+            if want_to not in _addresses(it.get("recipients")):
+                continue
+            if _norm_subject(str(it.get("subject") or "")) == want_subject:
                 return True
         return False
 
@@ -337,6 +349,40 @@ def _server_env() -> dict[str, str]:
         {k: v for k, v in os.environ.items() if k.startswith("MCP_EMAIL_SERVER_")}
     )
     return env
+
+
+def forwarded_subject(subject: str) -> str:
+    """Тема пересылки — так же, как её строит forward_email в mcp-email-server
+    1.6.2 (application/mutations.py, _forwarded_subject): «Fwd: » без повтора."""
+    return subject if subject.casefold().startswith("fwd:") else f"Fwd: {subject}"
+
+
+def _addresses(raw: Any) -> set[str]:
+    """Адреса из recipients: строки «Имя <a@b.ru>» или «a@b.ru»."""
+    items = raw if isinstance(raw, list) else [raw] if raw else []
+    out = set()
+    for item in items:
+        for part in str(item).split(","):
+            part = part.strip()
+            if "<" in part and ">" in part:
+                part = part[part.index("<") + 1 : part.index(">")]
+            if "@" in part:
+                out.add(part.strip().lower())
+    return out
+
+
+def _parse_dt(raw: Any) -> dt.datetime | None:
+    """Дата из метаданных: ISO-строка или datetime. Без зоны — считаем UTC."""
+    if isinstance(raw, dt.datetime):
+        value = raw
+    elif isinstance(raw, str) and raw:
+        try:
+            value = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
 
 
 def _norm_subject(subject: str) -> str:

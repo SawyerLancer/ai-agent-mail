@@ -64,6 +64,8 @@ async def lifespan(app: FastAPI):
             id="poll_events",
         )
     scheduler.start()
+    # В фоне: проверка «Отправленных» на большом ящике — секунды, старт не ждёт.
+    recovery = asyncio.create_task(handlers.recover_sending(), name="recover-sending")
     log.info(
         "бот запущен: почта каждые %d с, события — %s",
         settings.poll_interval,
@@ -72,6 +74,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        recovery.cancel()
         scheduler.shutdown(wait=False)
         await mail.stop()
         await pachca.close()

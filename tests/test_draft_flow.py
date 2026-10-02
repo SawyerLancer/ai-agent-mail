@@ -268,3 +268,60 @@ def test_forward_keeps_source_text(env):
     run(click(f"mail:fwd:{pk}"))
     with SessionLocal() as s:
         assert s.get(Draft, 1).source_text == BODY
+
+
+def _sending(pk, kind="reply"):
+    run(click(f"mail:{'reply' if kind == 'reply' else 'fwd'}:{pk}"))
+    with SessionLocal() as s:
+        d = s.get(Draft, 1)
+        d.status, d.preview_message_id = "sending", 555
+        if kind == "forward":
+            d.recipients = "boss@x.ru"
+        s.commit()
+
+
+def test_forward_timeout_checks_fwd_subject(env):
+    pk, _, m, _ = env
+
+    async def forward(**kw):
+        raise asyncio.TimeoutError()
+
+    m.forward = forward
+    run(click(f"mail:fwd:{pk}"))
+    run(say("boss@x.ru"))
+    run(click("draft:send:1", message_id=1002))
+    assert m.find_calls[-1]["subject"] == "Fwd: Счёт" and m.find_calls[-1]["to"] == "boss@x.ru"
+
+
+def test_recover_sending_found_becomes_sent(env):
+    pk, p, m, _ = env
+    _sending(pk)
+    m.in_sent = True
+    run(handlers.recover_sending())
+    assert _status() == "sent"
+    assert p.out[-1]["drop"] == 555 and p.out[-1]["content"].startswith("📨 Ответ отправлен на ivan@x.ru")
+    call = m.find_calls[-1]
+    assert call["subject"] == "Re: Счёт" and call["since"].tzinfo is not None
+
+
+def test_recover_sending_not_found_back_to_editing(env):
+    pk, p, m, _ = env
+    _sending(pk, kind="forward")
+    m.in_sent = False
+    run(handlers.recover_sending())
+    assert _status() == "editing"
+    assert m.find_calls[-1]["subject"] == "Fwd: Счёт"
+    assert any("Не уверен, ушло ли письмо" in o.get("content", "") for o in p.out)
+    assert p.out[-1]["buttons"]
+
+
+def test_expired_sending_says_not_sure(env):
+    import datetime as dt
+    pk, p, _, _ = env
+    _sending(pk)
+    with SessionLocal() as s:
+        s.get(Draft, 1).updated_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=49)
+        s.commit()
+    run(handlers.expire_drafts())
+    assert p.out[-1]["drop"] == 555 and "Не уверен, ушло ли письмо" in p.out[-1]["content"]
+    assert "Ответить» заново" not in p.out[-1]["content"]

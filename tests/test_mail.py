@@ -4,7 +4,7 @@ import datetime as dt
 import pytest
 
 from app import mail as mail_mod
-from app.mail import MailClient, MailToolError
+from app.mail import MailClient, MailToolError, forwarded_subject
 
 
 class HangingSession:
@@ -60,7 +60,7 @@ def test_server_error_is_mail_tool_error(monkeypatch):
         asyncio.run(c.send(to=["a@b.ru"], subject="s", body="b"))
 
 
-def test_find_sent_matches_subject(monkeypatch):
+def _sent_client(monkeypatch, emails):
     c = MailClient()
     calls = []
 
@@ -68,12 +68,56 @@ def test_find_sent_matches_subject(monkeypatch):
         calls.append((tool, args))
         if tool == "list_mailboxes":
             return [{"name": "Sent", "flags": ["\\Sent"]}, {"name": "INBOX", "flags": []}]
-        return {"emails": [{"subject": "Re:  Счёт"}]}
+        return {"emails": emails}
 
     monkeypatch.setattr(c, "call", call)
-    since = dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc)
-    assert asyncio.run(c.find_sent(to="a@b.ru", since=since, subject="re: счёт"))
-    assert not asyncio.run(c.find_sent(to="a@b.ru", since=since, subject="Re: Другое"))
+    return c, calls
+
+
+SINCE = dt.datetime(2026, 10, 2, 17, 0, tzinfo=dt.timezone.utc)
+
+
+def test_find_sent_matches_recipient_subject_and_time(monkeypatch):
+    c, calls = _sent_client(monkeypatch, [
+        {"subject": "Re:  Счёт", "date": "2026-10-02T17:01:00Z", "recipients": ["Иван <A@B.ru>"]},
+    ])
+    assert asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="re: счёт"))
+    assert not asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="Re: Другое"))
     args = calls[1][1]
-    assert args["mailbox"] == "Sent" and args["to_address"] == "a@b.ru"
-    assert args["since"].startswith("2026-10-02")
+    # Серверные to_address/since на Яндексе не работают — не передаём (skill mail-mcp).
+    assert args["mailbox"] == "Sent" and "to_address" not in args and "since" not in args
+    assert args["order"] == "desc"
+
+
+def test_find_sent_other_recipient_not_found(monkeypatch):
+    c, _ = _sent_client(monkeypatch, [
+        {"subject": "Re: Счёт", "date": "2026-10-02T17:01:00Z", "recipients": ["c@d.ru"]},
+    ])
+    assert not asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="Re: Счёт"))
+
+
+def test_find_sent_ignores_same_subject_sent_earlier_today(monkeypatch):
+    # Второй ответ в цепочке: тот же адресат и «Re: …», но утром — не наш.
+    c, _ = _sent_client(monkeypatch, [{"subject": "Re: Счёт", "date": "2026-10-02T09:15:00+00:00", "recipients": ["a@b.ru"]}])
+    assert not asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="Re: Счёт"))
+
+
+def test_find_sent_without_date_is_not_found(monkeypatch):
+    c, _ = _sent_client(monkeypatch, [{"subject": "Re: Счёт", "recipients": ["a@b.ru"]}, {"subject": "Re: Счёт", "date": "мусор", "recipients": ["a@b.ru"]}])
+    assert not asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="Re: Счёт"))
+
+
+def test_find_sent_naive_date_is_utc(monkeypatch):
+    c, _ = _sent_client(monkeypatch, [{"subject": "Re: Счёт", "date": "2026-10-02T17:05:00", "recipients": ["a@b.ru"]}])
+    assert asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject="Re: Счёт"))
+
+
+def test_forward_with_other_subject_not_found(monkeypatch):
+    c, _ = _sent_client(monkeypatch, [{"subject": "Fwd: Другое письмо", "date": "2026-10-02T17:01:00+00:00", "recipients": ["a@b.ru"]}])
+    assert not asyncio.run(c.find_sent(to="a@b.ru", since=SINCE, subject=forwarded_subject("Счёт")))
+
+
+def test_forwarded_subject_like_server():
+    assert forwarded_subject("Счёт") == "Fwd: Счёт"
+    assert forwarded_subject("FWD: Счёт") == "FWD: Счёт"
+    assert forwarded_subject("Re: Счёт") == "Fwd: Re: Счёт"

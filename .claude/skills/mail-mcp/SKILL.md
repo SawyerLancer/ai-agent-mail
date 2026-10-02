@@ -32,7 +32,7 @@ description: Работа с почтой через open-source MCP-серве�
 | `get_body(uid)` | `get_emails_content` | `account_name, mailbox, email_ids=[id], max_body_length, mark_as_read=False` |
 | `send(...)` | `send_email` | `account_name, recipients, subject, body, in_reply_to?, references?` — **без повтора** |
 | `forward(...)` | `forward_email` | `account_name, email_id, source_mailbox, recipients, body, include_attachments=True` — **без повтора** |
-| `find_sent(to, since, subject?)` | `list_emails_metadata` | `mailbox=<\Sent>, to_address, since (ISO, с зоной), page_size=10, order="desc"`; тема сравнивается без регистра и лишних пробелов |
+| `find_sent(to, since, subject)` | `list_emails_metadata` | `mailbox=<\Sent>, page_size=20, order="desc"` — **без `to_address` и `since`** (ниже почему); адресат, время и тема сверяются у нас |
 | `delete(uid)` | `move_emails` | `account_name, email_ids, source_mailbox, destination_mailbox=<\Trash>` |
 | `_trash_mailbox()` | `list_mailboxes` | `account_name` → папка с флагом `\Trash`, кэш |
 | `archive(uid)` | `archive_emails` | `account_name, mailbox, email_ids` — папка по флагу `\Archive` |
@@ -68,6 +68,33 @@ description: Работа с почтой через open-source MCP-серве�
   `\sent`) через `list_mailboxes`, кэш на время жизни процесса.
 - `send_email` не принимает свои заголовки (Message-ID задать нельзя) — проверено
   по исходникам 1.6.2.
+
+### Фильтры `list_emails_metadata` на живом ящике
+_Проверено на Яндексе 2026-10-02, mcp-email-server 1.6.2, сырым `imaplib` и через MCP._
+
+| Фильтр | Результат |
+|---|---|
+| `since` / `before` | **не работает**: сервер шлёт `SEARCH SINCE 01-OCT-2026` (месяц заглавными), Яндекс отвечает `BAD invalid date format` → `provider_failure`. С `01-Oct-2026` Яндекс отвечает нормально — это несовместимость сервера с Яндексом |
+| `to_address` с полным адресом | **0 писем** даже там, где письмо есть (`TO "a@b.ru"` → 0) |
+| `to_address` с частью до `@` | находит лишнее (по своему адресу — все письма папки) |
+| без фильтров, `order="desc"` | работает; `date` — ISO-строка `…Z`, из заголовка `Date` |
+
+Поэтому `find_sent` читает последние `_SENT_LOOKBACK=20` писем «Отправленных»
+и сам сверяет: точный адрес среди `recipients` (`_addresses`: «Имя <a@b>» и
+«a@b», без регистра), `date >= since` (без разбираемой даты — не найдено),
+тему без регистра и лишних пробелов. Тема пересылки — `forwarded_subject()`,
+как в сервере: «Fwd: <тема>» без двойного префикса, `Fw:` сервер не ставит.
+Живая проверка на письме из «Отправленных»: нашлось; since на минуту позже,
+другой адресат, другая тема — не нашлось. Время проверки ~8 с.
+
+Ограничения: если сервер не смог разобрать `Date`, он подставляет текущее
+время — такое письмо пройдёт проверку времени (у наших писем `Date` есть всегда).
+Копию в «Отправленные» сервер кладёт в папку с флагом `\Sent` (на Яндексе —
+«Отправленные»), а не по `SENT_FOLDER_NAME` из `.env`.
+
+**Не проверено вживую:** отправка тестового письма себе и поиск именно его —
+во время проверки VPN (hidemy.name) закрывал SMTP. Проверялось на уже лежащем
+в «Отправленных» письме.
 - `_close()` ждёт задачу 10 с, затем `cancel()`.
 
 ```python

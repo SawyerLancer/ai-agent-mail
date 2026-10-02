@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from . import cards, factcheck, llm, proofdiff, style
 from .config import settings
 from .db import Draft, SessionLocal, TrackedEmail
-from .mail import MailToolError, mail
+from .mail import MailToolError, forwarded_subject, mail
 from .pachca import pachca
 
 log = logging.getLogger(__name__)
@@ -338,9 +338,9 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         return
     await pachca.drop_buttons(message_id, content=f"📨 Отправляю…\n\n{body}")
 
-    # С запасом на расхождение часов с почтовым сервером.
-    started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
+    started = dt.datetime.now(dt.timezone.utc) - _CLOCK_SKEW
     reply_subject = _re_subject(subject)
+    sent_subject = forwarded_subject(subject or "") if kind == "forward" else reply_subject
     try:
         if kind == "forward":
             await mail.forward(uid=uid, to=to_list, note=body)
@@ -359,14 +359,8 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         return
     except Exception:  # noqa: BLE001 - таймаут или обрыв: результат неизвестен
         log.error("отправка без ответа сервера, проверяю «Отправленные»", exc_info=True)
-        if not await _found_in_sent(
-            to=to_list[0], since=started, subject=None if kind == "forward" else reply_subject
-        ):
-            await _back_to_editing(
-                draft_id,
-                "Не уверен, ушло ли письмо — проверьте «Отправленные». "
-                "Если его там нет, отправьте ещё раз.",
-            )
+        if not await _found_in_sent(to=to_list[0], since=started, subject=sent_subject):
+            await _back_to_editing(draft_id, NOT_SURE)
             return
         log.info("письмо нашлось в «Отправленных», считаю отправленным")
 
@@ -389,7 +383,49 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         ))
 
 
-async def _found_in_sent(*, to: str, since: dt.datetime, subject: str | None) -> bool:
+async def recover_sending() -> None:
+    """После рестарта: черновики, застрявшие в sending, — бот упал посреди
+    отправки. Ищем письмо в «Отправленных»; нет — возвращаем к правке."""
+    with SessionLocal() as s:
+        stuck = [
+            (d.id, d.kind, d.recipients, d.body, d.preview_message_id, d.updated_at, e.subject, e.sender)
+            for d, e in s.execute(
+                select(Draft, TrackedEmail)
+                .join(TrackedEmail, TrackedEmail.id == Draft.email_pk)
+                .where(Draft.status == "sending")
+            ).all()
+        ]
+    for draft_id, kind, recipients, body, preview, updated_at, subject, sender in stuck:
+        since = _aware(updated_at) - _CLOCK_SKEW
+        if kind == "forward":
+            to, sent_subject = (_split(recipients) or [""])[0], forwarded_subject(subject or "")
+            done = f"↪️ Переслано: {recipients}"
+        else:
+            to, sent_subject = _address_of(sender), _re_subject(subject)
+            done = f"📨 Ответ отправлен на {to}"
+        try:
+            found = bool(to) and await _found_in_sent(to=to, since=since, subject=sent_subject)
+            if found:
+                with SessionLocal() as s:
+                    d = s.get(Draft, draft_id)
+                    if d is not None:
+                        d.status = "sent"
+                        s.commit()
+                if preview:
+                    await pachca.drop_buttons(preview, content=f"{done}\n\n{body}")
+            else:
+                await _back_to_editing(draft_id, NOT_SURE)
+            log.info("черновик %s после рестарта: %s", draft_id, "sent" if found else "editing")
+        except Exception:  # noqa: BLE001 - один черновик не должен мешать остальным
+            log.error("не удалось восстановить черновик %s", draft_id, exc_info=True)
+
+
+def _aware(value: dt.datetime) -> dt.datetime:
+    """SQLite отдаёт время без зоны; пишем мы его в UTC."""
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+
+
+async def _found_in_sent(*, to: str, since: dt.datetime, subject: str) -> bool:
     try:
         return await mail.find_sent(to=to, since=since, subject=subject)
     except Exception:  # noqa: BLE001 - не смогли проверить = не уверены
@@ -530,14 +566,14 @@ async def expire_drafts() -> int:
         stale = s.scalars(
             select(Draft).where(Draft.status.in_(_EXPIRABLE), Draft.updated_at < border)
         ).all()
-        previews = [d.preview_message_id for d in stale if d.preview_message_id]
+        previews = [(d.preview_message_id, d.status) for d in stale if d.preview_message_id]
         for d in stale:
             d.status = "expired"
         s.commit()
-    for message_id in previews:
-        await pachca.drop_buttons(
-            message_id, content="_Черновик устарел — нажмите «Ответить» заново._"
-        )
+    for message_id, was in previews:
+        # Застрявший sending — не «устарел»: письмо могло уйти.
+        text = NOT_SURE if was == "sending" else "_Черновик устарел — нажмите «Ответить» заново._"
+        await pachca.drop_buttons(message_id, content=text)
     return len(stale)
 
 
@@ -555,6 +591,11 @@ async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
 
 # Черновики, с которыми ещё работают: их ищут правки и гасит срок жизни.
 _OPEN = ("editing", "awaiting_text")
+_CLOCK_SKEW = dt.timedelta(minutes=2)   # запас на расхождение часов с почтовым сервером
+NOT_SURE = (
+    "Не уверен, ушло ли письмо — проверьте «Отправленные». "
+    "Если его там нет, отправьте ещё раз."
+)
 # «sending» навсегда остаётся, только если бот упал посреди отправки — гасим сроком.
 _EXPIRABLE = (*_OPEN, "sending")
 
