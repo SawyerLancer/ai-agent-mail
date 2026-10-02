@@ -67,9 +67,14 @@ def draft_card(
         parts.append("_Проверить ошибки не удалось — модель недоступна. Текст как есть._")
     elif proof is not None:
         parts.append(_proof_note(proof))
-    added = _added(draft)
+    added = _json_list(draft.added_facts)
     if added:
         parts.append("⚠️ Модель добавила: " + ", ".join(added))
+    from_history = _json_list(draft.history_facts)
+    if from_history:
+        parts.append("ℹ️ Из прошлой переписки (проверьте, не изменилось ли): " + ", ".join(from_history))
+    if draft.history_count:
+        parts.append(f"_Учтено писем переписки: {draft.history_count}_")
     parts.append(
         "—\nНапишите в этот тред правку («короче», «добавь про сроки»), и я перепишу. "
         "«Свой текст» — пришлёте письмо целиком, исправлю только ошибки. "
@@ -98,9 +103,9 @@ def _plain(fragment: str) -> str:
     return fragment.replace("*", "").replace("_", "").replace("\n", " ").strip()
 
 
-def _added(draft: Draft) -> list[str]:
+def _json_list(raw: str | None) -> list[str]:
     try:
-        items = json.loads(draft.added_facts or "[]")
+        items = json.loads(raw or "[]")
     except json.JSONDecodeError:
         return []
     return [str(x) for x in items] if isinstance(items, list) else []

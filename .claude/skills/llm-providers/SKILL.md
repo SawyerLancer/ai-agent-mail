@@ -19,13 +19,16 @@ class LLM(ABC):
 
 | Функция | Где | Что |
 |---|---|---|
-| `draft_reply(sender, subject, body, instruction=None, style_rules=())` | «Ответить», «Заново» | черновик + подпись |
-| `revise(current, instruction, sender, subject, style_rules=())` | сообщение в треде | новый текст черновика + подпись |
+| `draft_reply(sender, subject, body, instruction=None, style_rules=(), history="")` | «Ответить», «Заново» | черновик + подпись |
+| `revise(current, instruction, sender, subject, style_rules=(), history="")` | сообщение в треде | новый текст черновика + подпись |
 | `summarize(sender, subject, body)` | карточка письма | 1–2 предложения; при ошибке `""` |
 | `proofread(text)` | «Свой текст» | только ошибки; свой `PROOFREAD_SYSTEM`; без стиля и подписи; пусто → исключение |
 | `extract_style(user_texts, edits, existing)` | после отправки | сырой JSON операций для `style.parse_ops` (`style-memory`) |
 
-Блок стиля собирает `_style_block`.
+Блок стиля собирает `_style_block`; `history` — готовый блок `thread_context.render`
+(skill `thread-context`), в `proofread`/`summarize`/`extract_style` истории нет.
+Все подстановки недоверенного текста — через `promptsafe.escape`
+(`email-actions-safety`).
 
 ### Провайдеры
 | `LLM_PROVIDER` | Класс | SDK | Модель по умолчанию |

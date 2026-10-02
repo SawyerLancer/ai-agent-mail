@@ -7,10 +7,10 @@ import json
 import logging
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from . import cards, factcheck, llm, proofdiff, style
+from . import cards, factcheck, llm, proofdiff, style, thread_context
 from .config import settings
 from .db import Draft, SessionLocal, TrackedEmail
 from .mail import MailToolError, forwarded_subject, mail
@@ -108,6 +108,7 @@ async def handle_message(event: dict[str, Any]) -> None:
             return
         draft_id, kind, status = draft.id, draft.kind, draft.status
         current, subject, sender = draft.body, email.subject, email.sender
+        history = draft.history_text
         old_preview = draft.preview_message_id
 
     # «Свой текст»: модель исправляет только ошибки, без стиля и подписи.
@@ -133,7 +134,7 @@ async def handle_message(event: dict[str, Any]) -> None:
     try:
         revised = await llm.revise(
             current=current, instruction=text, sender=sender, subject=subject,
-            style_rules=_style_rules(recipient),
+            style_rules=_style_rules(recipient), history=history,
         )
     except Exception:  # noqa: BLE001 - ошибку модели показываем человеку
         log.error("LLM не смог переписать черновик", exc_info=True)
@@ -180,10 +181,11 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
     await pachca.send_to_thread(thread_id, "Готовлю черновик ответа…")
 
     body = await _body_of(email)
+    history, history_count, prompt_body = await _history_for(email, body)
     try:
         text = await llm.draft_reply(
-            sender=email.sender, subject=email.subject, body=body,
-            style_rules=_style_rules(_address_of(email.sender)),
+            sender=email.sender, subject=email.subject, body=prompt_body,
+            style_rules=_style_rules(_address_of(email.sender)), history=history,
         )
     except Exception:  # noqa: BLE001
         log.error("LLM не смог составить черновик", exc_info=True)
@@ -196,6 +198,7 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
         draft = Draft(
             email_pk=email_pk, thread_id=thread_id, kind="reply",
             source_text=body[: settings.body_chars_for_llm], first_ai_body=text,
+            history_text=history, history_count=history_count,
         )
         s.add(draft)
         _set_body(s, draft, text)
@@ -368,6 +371,7 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         draft = s.get(Draft, draft_id)
         assert draft is not None
         draft.status = "sent"
+        draft.sent_at = dt.datetime.now(dt.timezone.utc)
         s.commit()
         user_texts, first_ai = _user_texts(draft), draft.first_ai_body
         human_final = draft.body_source == "human"
@@ -410,6 +414,8 @@ async def recover_sending() -> None:
                     d = s.get(Draft, draft_id)
                     if d is not None:
                         d.status = "sent"
+                        # точного момента не знаем — начало отправки ближе всего
+                        d.sent_at = _aware(updated_at)
                         s.commit()
                 if preview:
                     await pachca.drop_buttons(preview, content=f"{done}\n\n{body}")
@@ -460,13 +466,15 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
 
     # Тело уже сохранено при «Ответить»; заново из ящика — только у старых черновиков.
     body = source or await _body_of(email)
+    history, history_count, prompt_body = await _history_for(email, body)
     try:
         text = await llm.draft_reply(
             sender=email.sender,
             subject=email.subject,
-            body=body,
+            body=prompt_body,
             instruction="Предложи другой вариант: иная структура и формулировки.",
             style_rules=_style_rules(_address_of(email.sender)),
+            history=history,
         )
     except Exception:  # noqa: BLE001
         log.error("LLM не смог перегенерировать черновик", exc_info=True)
@@ -479,6 +487,7 @@ async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         if not draft.source_text:
             draft.source_text = body[: settings.body_chars_for_llm]
         draft.first_ai_body = text      # новая точка отсчёта для правок человека
+        draft.history_text, draft.history_count = history, history_count
         _set_body(s, draft, text)
         s.commit()
         card, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id)
@@ -554,6 +563,34 @@ async def _use_raw(draft_id: int, message_id: int) -> None:
     await pachca.drop_buttons(message_id, content="_Вернул ваш текст без правок — ниже._")
     msg = await pachca.send_to_thread(thread_id, card, cards.draft_buttons(draft_id))
     _remember_preview(draft_id, msg.get("id"))
+
+
+def purge_old_bodies(now: dt.datetime | None = None) -> int:
+    """Срок хранения: тела писем и история закрытых черновиков старше
+    BODY_RETENTION_DAYS — стираем (skill email-actions-safety)."""
+    border = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=settings.body_retention_days)
+    with SessionLocal() as s:
+        n = s.execute(
+            update(TrackedEmail)
+            .where(TrackedEmail.created_at < border, TrackedEmail.body_text != "")
+            .values(body_text="")
+        ).rowcount
+        n += s.execute(
+            update(Draft)
+            .where(
+                Draft.status.not_in(_EXPIRABLE),
+                Draft.updated_at < border,
+                (Draft.body != "") | (Draft.source_text != "") | (Draft.history_text != "")
+                | (Draft.user_texts != "[]") | (Draft.first_ai_body != ""),
+            )
+            .values(
+                body="", first_ai_body="", source_text="", history_text="",
+                user_texts="[]", original_text="", added_facts="[]", history_facts="[]",
+            )
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        s.commit()
+    return n
 
 
 async def expire_drafts() -> int:
@@ -647,7 +684,96 @@ def _set_body(s: Session, draft: Draft, body: str, *, source: str = "ai") -> Non
     sources = [draft.source_text, *_user_texts(draft), settings.signature]
     if email is not None:
         sources += [email.subject, email.sender]
-    draft.added_facts = json.dumps(factcheck.added(body, sources), ensure_ascii=False)
+    invented, from_history = factcheck.classify(
+        body, sources, thread_context.plain(draft.history_text)
+    )
+    draft.added_facts = json.dumps(invented, ensure_ascii=False)
+    draft.history_facts = json.dumps(from_history, ensure_ascii=False)
+
+
+async def _history_for(email: TrackedEmail, body: str) -> tuple[str, int, str]:
+    """(блок истории для промпта, сколько писем учтено, тело для промпта).
+
+    Синхронная работа с БД — в отдельном потоке, чтобы не держать цикл событий.
+    Ошибка сбора — не повод остаться без черновика: пишем как раньше, без истории.
+    """
+    try:
+        return await asyncio.to_thread(_collect_history, email, body)
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось собрать историю переписки", exc_info=True)
+        return "", 0, body
+
+
+# Сколько раз дочитывать письма по новым Message-ID из найденных (транзитивность).
+_HISTORY_REF_ROUNDS = 3
+_HISTORY_MAX_CANDIDATES = 200
+
+
+def _collect_history(email: TrackedEmail, body: str) -> tuple[str, int, str]:
+    current = _incoming(email, body)
+    days = max(settings.history_subject_window_days, settings.body_retention_days)
+    border = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    base = select(TrackedEmail).where(
+        TrackedEmail.account == email.account,     # только этот ящик
+        TrackedEmail.id != email.id,
+        TrackedEmail.body_text != "",
+        TrackedEmail.created_at >= border,
+    )
+    with SessionLocal() as s:
+        # Не весь ящик: та же тема, тот же собеседник или письма из ссылок.
+        ids = set(thread_context.message_ids(email.in_reply_to, email.references))
+        found: dict[int, TrackedEmail] = {}
+        conds = [TrackedEmail.norm_subject == current.norm_subject] if current.norm_subject else []
+        if current.sender_addr:
+            conds.append(TrackedEmail.sender_addr == current.sender_addr)
+        if conds:
+            for row in s.scalars(base.where(or_(*conds)).limit(_HISTORY_MAX_CANDIDATES)):
+                found[row.id] = row
+        seen_ids: set[str] = set()
+        for _ in range(_HISTORY_REF_ROUNDS):
+            new = ids - seen_ids
+            if not new:
+                break
+            seen_ids |= new
+            wanted = {f"<{i}>" for i in new} | new
+            for row in s.scalars(base.where(TrackedEmail.rfc_message_id.in_(wanted)).limit(_HISTORY_MAX_CANDIDATES)):
+                if row.id not in found:
+                    found[row.id] = row
+                    ids |= set(thread_context.message_ids(row.in_reply_to, row.references))
+        candidates = [_incoming(r, r.body_text) for r in found.values()]
+        chain_pks = [c.pk for c in candidates] + [email.id]
+        sent = [
+            thread_context.SentReply(d.email_pk, d.body, _aware(d.sent_at or d.updated_at))
+            for d in s.scalars(
+                select(Draft).where(
+                    Draft.status == "sent", Draft.kind == "reply",
+                    Draft.email_pk.in_(chain_pks), Draft.body != "",
+                )
+            )
+        ]
+    history = thread_context.collect(
+        current, candidates, sent,
+        subject_window_days=settings.history_subject_window_days,
+        max_chars=settings.history_chars,
+        max_messages=settings.history_max_messages,
+    )
+    prompt_body = thread_context.split_quote(body)[0] if history.cut_current_quote else body
+    return thread_context.render(history), history.count, prompt_body
+
+
+def _incoming(row: TrackedEmail, body: str) -> thread_context.Incoming:
+    return thread_context.Incoming(
+        pk=row.id,
+        message_id=(row.rfc_message_id or "").strip("<>"),
+        in_reply_to=row.in_reply_to or "",
+        references=row.references or "",
+        sender=row.sender or "",
+        sender_addr=row.sender_addr or thread_context.address_of(row.sender),
+        norm_subject=row.norm_subject or thread_context.norm_subject(row.subject),
+        subject=row.subject or "",
+        body=body or "",
+        date=_aware(row.mail_date or row.created_at),
+    )
 
 # Кнопки, которые живут на самой карточке письма (не на подтверждении удаления).
 _CARD_ACTIONS = {

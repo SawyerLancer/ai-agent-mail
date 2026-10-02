@@ -82,7 +82,12 @@ def env(monkeypatch):
     async def learn(**kw):
         calls["learn"].append(kw)
 
+    async def revise(**kw):
+        calls.setdefault("revise", []).append(kw)
+        return "Переписанный черновик"
+
     monkeypatch.setattr(llm, "draft_reply", draft_reply)
+    monkeypatch.setattr(llm, "revise", revise)
     monkeypatch.setattr(llm, "proofread", proofread)
     monkeypatch.setattr(style, "learn", learn)
     return pk, p, m, calls
@@ -325,3 +330,132 @@ def test_expired_sending_says_not_sure(env):
     run(handlers.expire_drafts())
     assert p.out[-1]["drop"] == 555 and "Не уверен, ушло ли письмо" in p.out[-1]["content"]
     assert "Ответить» заново" not in p.out[-1]["content"]
+
+
+# --- история переписки ---
+
+def _add_history(pk_current):
+    """Прошлое письмо той же цепочки и наш отправленный ответ на него."""
+    import datetime as dt
+    with SessionLocal() as s:
+        cur = s.get(TrackedEmail, pk_current)
+        cur.in_reply_to, cur.references = "<old@x>", "<old@x>"
+        old = TrackedEmail(account="a", mailbox="INBOX", uid=4, rfc_message_id="<old@x>", subject="Счёт",
+                           sender="Иван <ivan@x.ru>", norm_subject="счет", sender_addr="ivan@x.ru",
+                           body_text="Поставка 20 марта, счёт пришлём.\n\n1 сент. 2026 г., 09:00, Иван <ivan@x.ru> пишет:\n> цитата",
+                           mail_date=dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+        foreign = TrackedEmail(account="other", mailbox="INBOX", uid=9, rfc_message_id="<old@x>", subject="Счёт",
+                               sender="Иван <ivan@x.ru>", body_text="ЧУЖОЙ ЯЩИК")
+        s.add_all([old, foreign])
+        s.commit()
+        s.add(Draft(email_pk=old.id, thread_id=1, kind="reply", status="sent", body="НАШ ПРОШЛЫЙ ОТВЕТ"))
+        s.commit()
+
+
+def test_reply_gets_history_and_shows_count(env):
+    pk, p, _, calls = env
+    _add_history(pk)
+    run(click(f"mail:reply:{pk}"))
+    h = calls["draft_reply"][-1]["history"]
+    assert "Поставка 20 марта" in h and "НАШ ПРОШЛЫЙ ОТВЕТ" in h
+    assert "> цитата" not in h and "ЧУЖОЙ ЯЩИК" not in h
+    card = p.out[-1]["content"]
+    assert "Учтено писем переписки: 2" in card
+    # «20 марта» в ответе модели — из истории, не выдумка, но показан мягко
+    assert "ℹ️ Из прошлой переписки" in card and "20 марта" in card.split("ℹ️")[1]
+    assert "⚠️ Модель добавила: 20 марта" not in card
+
+
+def test_no_history_no_count_line(env):
+    pk, p, _, calls = env
+    run(click(f"mail:reply:{pk}"))
+    assert calls["draft_reply"][-1]["history"] == ""
+    assert "Учтено писем переписки" not in p.out[-1]["content"]
+
+
+def test_history_error_does_not_break_draft(env, monkeypatch):
+    pk, p, _, calls = env
+
+    def boom(*a, **kw):
+        raise RuntimeError("сломалось")
+
+    monkeypatch.setattr(handlers.thread_context, "collect", boom)
+    run(click(f"mail:reply:{pk}"))
+    assert calls["draft_reply"][-1]["history"] == "" and "Черновик ответа" in p.out[-1]["content"]
+
+
+def test_style_learn_gets_no_history(env):
+    pk, _, _, calls = env
+    _add_history(pk)
+
+    async def scenario():
+        await click(f"mail:reply:{pk}")
+        await say("короче")
+        await click("draft:send:2", message_id=1003)
+        await asyncio.gather(*handlers._bg_tasks)
+
+    run(scenario())
+    dumped = json.dumps(calls["learn"][-1], ensure_ascii=False)
+    assert "Поставка 20 марта" not in dumped and "НАШ ПРОШЛЫЙ ОТВЕТ" not in dumped
+
+
+def test_purge_keeps_our_reply_date(env):
+    import datetime as dt
+    pk, _, _, calls = env
+    _add_history(pk)
+    sent_at = dt.datetime(2026, 9, 2, 10, 0, tzinfo=dt.timezone.utc)
+    with SessionLocal() as s:
+        d = s.query(Draft).filter_by(status="sent").one()
+        d.sent_at = sent_at
+        s.commit()
+    # Очистка закрытого черновика с другим текстом трогает updated_at у всех UPDATE-нутых строк.
+    with SessionLocal() as s:
+        s.add(Draft(email_pk=pk, thread_id=1, kind="reply", status="cancelled", body="старьё",
+                    updated_at=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)))
+        s.commit()
+    handlers.purge_old_bodies(now=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc))
+    run(click(f"mail:reply:{pk}"))
+    assert 'дата="2026-09-02 10:00"' in calls["draft_reply"][-1]["history"]
+
+
+def test_purge_clears_all_texts_of_closed_drafts(env):
+    import datetime as dt
+    pk, _, _, _ = env
+    with SessionLocal() as s:
+        old = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        s.add_all([
+            Draft(email_pk=pk, thread_id=1, kind="reply", status="sent", body="b", first_ai_body="f",
+                  source_text="s", history_text="h", user_texts='["u"]', original_text="o",
+                  added_facts='["a"]', history_facts='["x"]', updated_at=old),
+            Draft(email_pk=pk, thread_id=1, kind="reply", status="editing", body="живой", updated_at=old),
+        ])
+        s.commit()
+    handlers.purge_old_bodies(now=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc))
+    with SessionLocal() as s:
+        closed = s.query(Draft).filter_by(status="sent").one()
+        assert (closed.body, closed.first_ai_body, closed.source_text, closed.history_text,
+                closed.user_texts, closed.original_text, closed.added_facts, closed.history_facts) == \
+            ("", "", "", "", "[]", "", "[]", "[]")
+        assert s.query(Draft).filter_by(status="editing").one().body == "живой"
+
+
+def test_sent_sets_sent_at(env):
+    pk, _, _, _ = env
+    run(click(f"mail:reply:{pk}"))
+    run(click("draft:send:1", message_id=1001))
+    with SessionLocal() as s:
+        assert s.get(Draft, 1).sent_at is not None
+
+
+def test_purge_old_bodies(env):
+    import datetime as dt
+    pk, _, _, _ = env
+    _add_history(pk)
+    with SessionLocal() as s:
+        for e in s.query(TrackedEmail).all():
+            e.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        s.commit()
+    later = dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc)
+    assert handlers.purge_old_bodies(now=later) >= 2
+    with SessionLocal() as s:
+        assert all(e.body_text == "" for e in s.query(TrackedEmail).all())

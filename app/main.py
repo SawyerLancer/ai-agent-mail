@@ -95,6 +95,9 @@ async def _poll_job() -> None:
 async def _expire_job() -> None:
     try:
         n = await handlers.expire_drafts()
+        purged = handlers.purge_old_bodies()
+        if purged:
+            log.info("по сроку хранения очищено тел писем и историй: %d", purged)
         if n:
             log.info("устаревших черновиков погашено: %d", n)
     except Exception:  # noqa: BLE001 - джоба не должна умирать насовсем

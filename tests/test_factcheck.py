@@ -151,3 +151,22 @@ def test_sreda_lookalikes_are_not_wednesday():
 
 def test_tomorrow_not_found_inside_day_after():
     assert keys("послезавтра", "relative") == [("послезавтра",)]
+
+
+# --- история переписки ---
+
+from app.factcheck import classify  # noqa: E402
+
+
+def test_date_from_history_is_info_not_invented():
+    invented, from_history = classify("Ждём поставку 15 марта", ["Когда поставка?"], history="Поставим 15 марта.")
+    assert invented == [] and from_history == ["15 марта"]
+
+
+def test_fact_absent_everywhere_is_invented():
+    invented, from_history = classify("Ждём поставку 20 марта", ["Когда?"], history="Поставим 15 марта.")
+    assert invented == ["20 марта"] and from_history == []
+
+
+def test_fact_in_current_letter_is_neither():
+    assert classify("Ждём 15 марта", ["Привезём 15 марта"], history="15 марта") == ([], [])

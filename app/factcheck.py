@@ -193,3 +193,18 @@ def added(output: str, sources: Iterable[str]) -> list[str]:
         if not ok and f.surface not in result:
             result.append(f.surface)
     return result
+
+
+def classify(output: str, sources: Iterable[str], history: str = "") -> tuple[list[str], list[str]]:
+    """(добавлено моделью, найдено только в прошлой переписке).
+
+    Факт из истории — не выдумка, но срок или сумма могли с тех пор смениться,
+    поэтому показываем его мягко («ℹ️»), отдельно от «⚠️».
+    """
+    sources = list(sources)
+    not_in_current = added(output, sources)
+    if not history:
+        return not_in_current, []
+    invented = added(output, sources + [history])
+    from_history = [x for x in not_in_current if x not in invented]
+    return invented, from_history

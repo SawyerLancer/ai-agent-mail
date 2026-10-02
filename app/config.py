@@ -51,6 +51,12 @@ class Settings(BaseSettings):
         "", validation_alias=AliasChoices("OWNER_EMAIL", "MCP_EMAIL_SERVER_EMAIL_ADDRESS")
     )
 
+    # --- История переписки (skill thread-context) ---
+    history_chars: int = 6000                # вся история в промпте, символов
+    history_max_messages: int = 5
+    history_subject_window_days: int = 60    # склейка по теме — не старше
+    body_retention_days: int = 90            # тела писем и история в базе
+
     # --- Память стиля ---
     style_activate_hits: int = 2             # столько подтверждений — и правило в деле
     style_max_global: int = 15               # активных общих правил

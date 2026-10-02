@@ -52,6 +52,15 @@ class TrackedEmail(Base):
     thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     thread_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # --- для истории переписки (skill thread-context) ---
+    in_reply_to: Mapped[str] = mapped_column(Text, default="")
+    references: Mapped[str] = mapped_column(Text, default="")
+    sender_addr: Mapped[str] = mapped_column(String(320), default="")
+    norm_subject: Mapped[str] = mapped_column(Text, default="")
+    # исходный текст письма (вместе с цитатой), обрезанный; цитату отрезаем при
+    # чтении. Чистится через BODY_RETENTION_DAYS (skill email-actions-safety).
+    body_text: Mapped[str] = mapped_column(Text, default="")
+    mail_date: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("account", "mailbox", "uid", name="uq_tracked_uid"),
@@ -90,6 +99,14 @@ class Draft(Base):
     # кто автор текущего body: ai (draft_reply/revise) или human («Свой текст»,
     # «Без правок»). Правки черновика учим только у human (skill style-memory).
     body_source: Mapped[str] = mapped_column(String(8), default="ai")
+    # блок истории переписки, как он ушёл в промпт draft_reply (и уйдёт в revise)
+    history_text: Mapped[str] = mapped_column(Text, default="")
+    history_count: Mapped[int] = mapped_column(Integer, default=0)
+    # когда ушло письмо — дата «нашего ответа» в истории. Не updated_at: его
+    # сдвигает любой UPDATE, в том числе очистка по сроку хранения.
+    sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # JSON: факты из ответа, найденные только в истории — «ℹ️ из прошлой переписки»
+    history_facts: Mapped[str] = mapped_column(Text, default="[]")
     # JSON-список того, что модель добавила от себя (для «⚠️» в превью)
     added_facts: Mapped[str] = mapped_column(Text, default="[]")
 
@@ -152,7 +169,9 @@ def _add_missing_columns() -> None:
             for col in table.columns:
                 if col.name in have:
                     continue
-                ddl = f"ALTER TABLE {table.name} ADD COLUMN {col.name} " + col.type.compile(
+                # Имена — через quote: «references» и подобные — ключевые слова SQL.
+                q = _engine.dialect.identifier_preparer.quote
+                ddl = f"ALTER TABLE {q(table.name)} ADD COLUMN {q(col.name)} " + col.type.compile(
                     dialect=_engine.dialect
                 )
                 default = col.default.arg if col.default is not None and col.default.is_scalar else None

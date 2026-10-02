@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from . import cards
+from . import cards, thread_context
 from .config import settings
 from .db import SessionLocal, TrackedEmail, get_poll_state
 from .llm import summarize
@@ -96,6 +97,9 @@ async def _publish(meta: dict[str, Any]) -> bool:
             rfc_message_id=rfc_id,
             subject=subject,
             sender=sender,
+            norm_subject=thread_context.norm_subject(subject),
+            sender_addr=thread_context.address_of(sender),
+            mail_date=_parse_dt(meta.get("date")),
         )
         s.add(email)
         try:
@@ -111,12 +115,13 @@ async def _publish(meta: dict[str, Any]) -> bool:
     # иначе дедупликация навсегда спрячет письмо, которого никто не видел.
     try:
         # Тело тянем лениво — только чтобы показать превью и выжимку.
-        body = ""
+        body, content = "", {}
         try:
             content = await mail.get_body(uid)
             body = str(content.get("body") or content.get("content") or "")
         except Exception:  # noqa: BLE001 - карточка полезна и без тела
             log.warning("не удалось получить тело письма uid=%s", uid, exc_info=True)
+        _remember_thread_data(pk, body, content)
 
         summary = await summarize(sender=sender, subject=subject, body=body) if body else ""
         preview = _preview(body)
@@ -136,6 +141,35 @@ async def _publish(meta: dict[str, Any]) -> bool:
         _drop_claim(pk)
         raise
     return True
+
+
+# Сколько исходного текста письма храним для истории переписки.
+BODY_STORE_CHARS = 3000
+
+
+def _remember_thread_data(pk: int, body: str, content: dict[str, Any]) -> None:
+    """Для истории переписки: заголовки цепочки и исходный текст (с цитатой —
+    её отрезает split_quote при чтении, чтобы исправление разбора работало и
+    для старых писем). Ответ get_body уже есть — лишнего запроса к почте нет."""
+    try:
+        with SessionLocal() as s:
+            email = s.get(TrackedEmail, pk)
+            if email is None:
+                return
+            email.body_text = body[:BODY_STORE_CHARS]
+            email.in_reply_to = str(content.get("in_reply_to") or "")
+            email.references = str(content.get("references") or "")
+            s.commit()
+    except Exception:  # noqa: BLE001 - без истории карточка всё равно нужна
+        log.warning("не удалось сохранить данные цепочки для %s", pk, exc_info=True)
+
+
+def _parse_dt(raw: Any) -> dt.datetime | None:
+    try:
+        value = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
 
 
 def _drop_claim(pk: int) -> None:
