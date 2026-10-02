@@ -18,10 +18,19 @@ log = logging.getLogger(__name__)
 
 # Публичные почтовые домены: совпадение домена тут ничего не говорит о том,
 # что это одна компания, — только точный адрес.
+# Список неполный — дополняется PUBLIC_DOMAINS_EXTRA в .env.
 PUBLIC_DOMAINS = frozenset({
-    "gmail.com", "googlemail.com", "yandex.ru", "yandex.com", "ya.ru", "mail.ru",
-    "bk.ru", "list.ru", "inbox.ru", "rambler.ru", "outlook.com", "hotmail.com",
-    "live.com", "icloud.com", "me.com", "yahoo.com", "proton.me", "protonmail.com",
+    "gmail.com", "googlemail.com",
+    "yandex.ru", "yandex.com", "yandex.by", "yandex.kz", "yandex.ua", "yandex.com.tr", "ya.ru",
+    "mail.ru", "bk.ru", "list.ru", "inbox.ru", "internet.ru",
+    "rambler.ru", "ro.ru", "lenta.ru", "autorambler.ru", "myrambler.ru",
+    "ukr.net", "i.ua", "meta.ua",
+    "outlook.com", "outlook.ru", "hotmail.com", "live.com", "msn.com",
+    "icloud.com", "me.com",
+    "yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com",
+    "gmx.com", "gmx.de", "gmx.net", "web.de",
+    "proton.me", "protonmail.com", "pm.me", "tutanota.com", "tuta.io",
+    "zoho.com", "fastmail.com",
 })
 
 # Общие темы, по которым склеивать нельзя: у одного отправителя «Счёт» в марте
@@ -42,11 +51,18 @@ _REPLY_PREFIX = re.compile(r"^\s*(?:re|отв|ответ)\s*(?:\[\d+\]|\(\d+\))?
 # сомневаешься — не режь (лишняя цитата безобиднее отрезанного текста).
 _QUOTE_HEADER = re.compile(r"(?im)^.{0,200}\b(?:пишет|написал\(а\)|написала?|wrote)\s*:\s*$")
 # В шапке цитаты всегда есть дата, время или адрес — «Вот что бухгалтер пишет:» не шапка.
-_HEADER_HINT = re.compile(
-    r"\d{1,2}[:.]\d{2}|\d{1,2}[./]\d{1,2}[./]\d{2,4}|\d{4}|@|"
-    r"\b\d{1,2}\s+(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
+# Год сам по себе не признак («с 2019 года пишет:») — только время, полная
+# дата цифрами, день рядом с месяцем (в любом порядке) или адрес.
+_MONTH_WORD = r"(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-zа-яё]*\.?"
+_DATE_HINT = re.compile(
+    r"\b\d{1,2}:\d{2}\b|\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b|"
+    r"\b\d{1,2}\s+" + _MONTH_WORD + r"|\b" + _MONTH_WORD + r"\s+\d{1,2}\b",
     re.IGNORECASE,
 )
+
+
+def _hint(line: str) -> bool:
+    return "@" in line or bool(_DATE_HINT.search(line))
 _QUOTE_START = [
     re.compile(r"(?im)^-{2,}\s*(?:original message|исходное сообщение|пересылаемое сообщение|forwarded message)\b.*$"),
     re.compile(r"(?ims)^\s*(?:from|от)\s*:[^\n]*\n(?:[^\n]*\n){0,4}?\s*(?:sent|date|отправлено|дата)\s*:"),
@@ -131,7 +147,7 @@ def split_quote(body: str | None) -> tuple[str, str]:
     """(собственный текст, цитата). Нет надёжных маркеров — цитата пустая."""
     text = body or ""
     starts = [m.start() for rx in _QUOTE_START for m in [rx.search(text)] if m]
-    starts += [m.start() for m in _QUOTE_HEADER.finditer(text) if _HEADER_HINT.search(m.group(0))]
+    starts += [_header_start(text, m) for m in _QUOTE_HEADER.finditer(text) if _header_ok(text, m)]
     gt = _gt_block_start(text)
     if gt is not None:
         starts.append(gt)
@@ -142,6 +158,36 @@ def split_quote(body: str | None) -> tuple[str, str]:
         return text.strip(), ""
     cut = min(starts)
     return text[:cut].rstrip(), text[cut:].strip()
+
+
+def _prev_line(text: str, m: re.Match[str]) -> tuple[int, str]:
+    end = m.start() - 1                      # «\n» перед строкой шапки
+    if end < 0:
+        return -1, ""
+    start = text.rfind("\n", 0, end) + 1
+    return start, text[start:end]
+
+
+def _wrapped(prev: str, line: str) -> bool:
+    """Шапка перенесена на две строки (Gmail: «On Mon, Oct 2, 2026 at 2:05 PM John <»
+    / «a@b.com> wrote:»): в строке с «wrote:» даты нет, в предыдущей — есть."""
+    return (
+        bool(prev.strip())
+        and not prev.rstrip().endswith((".", "!", "?", ":"))
+        and bool(_DATE_HINT.search(prev))
+        and not _DATE_HINT.search(line)
+    )
+
+
+def _header_ok(text: str, m: re.Match[str]) -> bool:
+    _, prev = _prev_line(text, m)
+    return _hint(m.group(0)) or _wrapped(prev, m.group(0))
+
+
+def _header_start(text: str, m: re.Match[str]) -> int:
+    """Разрез — по первой строке шапки, даже если клиент перенёс её на две."""
+    start, prev = _prev_line(text, m)
+    return start if start >= 0 and _wrapped(prev, m.group(0)) else m.start()
 
 
 def _gt_block_start(text: str) -> int | None:
@@ -190,11 +236,13 @@ def collect(
     subject_window_days: int,
     max_chars: int,
     max_messages: int,
+    same_domain: bool = True,
+    public_domains: frozenset[str] | set[str] = PUBLIC_DOMAINS,
 ) -> History:
     """Цепочка для текущего письма: заголовки → (запасной вариант) тема +
     точный адрес собеседника; плюс наши отправленные ответы; затем бюджет."""
     earlier = [c for c in candidates if c.pk != current.pk and c.date <= current.date]
-    chain = _by_headers(current, earlier)
+    chain = _by_headers(current, earlier, same_domain=same_domain, public_domains=public_domains)
     if not chain:
         chain = _by_subject(current, earlier, subject_window_days)
 
@@ -214,17 +262,33 @@ def collect(
     return History(items=fit_budget(items, max_chars=max_chars, max_messages=max_messages), cut_current_quote=cut)
 
 
-def same_party(a: str, b: str) -> bool:
-    """Тот же собеседник: точный адрес, либо один корпоративный домен."""
+def same_party(
+    a: str,
+    b: str,
+    *,
+    same_domain: bool = True,
+    public_domains: frozenset[str] | set[str] = PUBLIC_DOMAINS,
+) -> bool:
+    """Тот же собеседник: точный адрес, либо (если same_domain) один домен,
+    которого нет среди публичных. Адреса сравниваются без регистра."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
     if not a or not b:
         return False
     if a == b:
         return True
+    if not same_domain:
+        return False
     da, db = a.rsplit("@", 1)[-1], b.rsplit("@", 1)[-1]
-    return da == db and da not in PUBLIC_DOMAINS
+    return da == db and da not in public_domains
 
 
-def _by_headers(current: Incoming, earlier: list[Incoming]) -> list[Incoming]:
+def _by_headers(
+    current: Incoming,
+    earlier: list[Incoming],
+    *,
+    same_domain: bool = True,
+    public_domains: frozenset[str] | set[str] = PUBLIC_DOMAINS,
+) -> list[Incoming]:
     """Транзитивно по In-Reply-To/References, но только через письма того же
     собеседника (same_party): иначе тот, кто однажды был в копии, подделав
     References, получил бы в черновик ответа ему нашу переписку с другим.
@@ -243,7 +307,8 @@ def _by_headers(current: Incoming, earlier: list[Incoming]) -> list[Incoming]:
                 continue
             if not ((c.message_id and c.message_id in ids) or (refs[c.pk] & ids)):
                 continue
-            if not same_party(c.sender_addr, current.sender_addr):
+            if not same_party(c.sender_addr, current.sender_addr,
+                              same_domain=same_domain, public_domains=public_domains):
                 rejected.add(c.pk)
                 log.info("письмо %s связано заголовками, но от другого собеседника — не в истории", c.pk)
                 continue

@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     history_max_messages: int = 5
     history_subject_window_days: int = 60    # склейка по теме — не старше
     body_retention_days: int = 90            # тела писем и история в базе
+    # Склейка по заголовкам: тот же корпоративный домен = тот же собеседник.
+    # Для бота нескольких людей — false (только точный адрес).
+    history_same_domain: bool = True
+    public_domains_extra: str = ""           # через запятую, дополняет PUBLIC_DOMAINS
 
     # --- Память стиля ---
     style_activate_hits: int = 2             # столько подтверждений — и правило в деле

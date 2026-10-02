@@ -45,6 +45,21 @@ def test_revise_history_not_double_escaped(cap):
     assert p.count("<письмо_истории") == 1 and "‹письмо_истории" not in p
 
 
+def test_unclosed_tag_replaces_only_marker():
+    assert escape("пришлю <письмо от юриста завтра > вечером") == "пришлю ‹письмо от юриста завтра› вечером"
+    assert escape("пришлю <письмо от юриста завтра") == "пришлю ‹письмо от юриста завтра"
+
+
+def test_proofread_keeps_unclosed_tag_text(monkeypatch):
+    class Echo:
+        async def complete(self, system, prompt):
+            return prompt.split("<текст_пользователя>\n", 1)[1].rsplit("\n</текст_пользователя>", 1)[0]
+
+    monkeypatch.setattr(llm, "get_llm", lambda: Echo())
+    for text in ["пришлю <письмо от юриста завтра", "<письмо> и потом <письмо от юриста"]:
+        assert asyncio.run(llm.proofread(text)) == text
+
+
 def test_escape_keeps_ordinary_text_and_addresses():
     assert escape("Иван <ivan@x.ru>, 5 < 7, <b>жирный</b>") == "Иван <ivan@x.ru>, 5 < 7, <b>жирный</b>"
 

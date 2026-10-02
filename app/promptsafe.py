@@ -27,8 +27,11 @@ DATA_TAGS = (
     "текущие_правила",
 )
 
+# Маркер «<письмо» / «</ письмо»; закрывающая «>» в той же строке — вместе с
+# атрибутами. Без «>» меняем только маркер и не захватываем текст дальше:
+# «пришлю <письмо от юриста» — это не тег, а слова пользователя.
 _TAG = re.compile(
-    r"<\s*/?\s*(?:" + "|".join(sorted(DATA_TAGS, key=len, reverse=True)) + r")\b[^<>]*>?",
+    r"(<\s*/?\s*(?:" + "|".join(sorted(DATA_TAGS, key=len, reverse=True)) + r")\b)([^<>\n]*>)?",
     re.IGNORECASE,
 )
 
@@ -52,12 +55,19 @@ def escape(text: str | None) -> str:
     probe = text.translate(_BRACKETS)
     out, last = [], 0
     for m in _TAG.finditer(probe):
-        inner = probe[m.start() : m.end()].strip("<>").strip()
         out.append(text[last : m.start()])
-        out.append("‹" + inner + "›")
+        out.append(_safe_form(m))
         last = m.end()
     out.append(text[last:])
     return "".join(out)
+
+
+def _safe_form(m: re.Match[str]) -> str:
+    """Безобидная форма найденного тега: «‹письмо x›» или, без «>», «‹письмо»."""
+    marker = m.group(1).lstrip("<").strip()
+    if m.group(2) is None:
+        return "‹" + marker
+    return "‹" + (marker + m.group(2)[:-1]).strip() + "›"
 
 
 def restore_user_tags(original: str, processed: str) -> str:
@@ -68,11 +78,11 @@ def restore_user_tags(original: str, processed: str) -> str:
     обратно, но только формы, которые escape сделал из оригинала.
     """
     probe = (original or "").translate(_BRACKETS)
-    for m in _TAG.finditer(probe):
-        raw = original[m.start() : m.end()]
-        escaped = "‹" + m.group(0).strip("<>").strip() + "›"
-        if raw != escaped:
-            processed = processed.replace(escaped, raw)
+    pairs = {_safe_form(m): original[m.start() : m.end()] for m in _TAG.finditer(probe)}
+    # Длинные формы первыми: «‹письмо» — начало «‹письмо›», иначе испортим его.
+    for escaped in sorted(pairs, key=len, reverse=True):
+        if pairs[escaped] != escaped:
+            processed = processed.replace(escaped, pairs[escaped])
     return processed
 
 

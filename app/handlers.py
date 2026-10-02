@@ -719,16 +719,30 @@ def _collect_history(email: TrackedEmail, body: str) -> tuple[str, int, str]:
         TrackedEmail.body_text != "",
         TrackedEmail.created_at >= border,
     )
+    party = _party_rule()
+    newest_first = TrackedEmail.created_at.desc()
     with SessionLocal() as s:
         # Не весь ящик: та же тема, тот же собеседник или письма из ссылок.
         ids = set(thread_context.message_ids(email.in_reply_to, email.references))
         found: dict[int, TrackedEmail] = {}
+
+        def take(rows: list[TrackedEmail], what: str) -> None:
+            if len(rows) >= _HISTORY_MAX_CANDIDATES:
+                log.info("история: кандидатов (%s) больше %d — старые отброшены", what, _HISTORY_MAX_CANDIDATES)
+            for row in rows:
+                if row.id in found:
+                    continue
+                found[row.id] = row
+                # Ссылки расширяют поиск, только если письмо от того же собеседника:
+                # чужие (в том числе подделанные) References не должны вести дальше.
+                if thread_context.same_party(row.sender_addr, current.sender_addr, **party):
+                    ids.update(thread_context.message_ids(row.in_reply_to, row.references))
+
         conds = [TrackedEmail.norm_subject == current.norm_subject] if current.norm_subject else []
         if current.sender_addr:
             conds.append(TrackedEmail.sender_addr == current.sender_addr)
         if conds:
-            for row in s.scalars(base.where(or_(*conds)).limit(_HISTORY_MAX_CANDIDATES)):
-                found[row.id] = row
+            take(list(s.scalars(base.where(or_(*conds)).order_by(newest_first).limit(_HISTORY_MAX_CANDIDATES))), "тема/собеседник")
         seen_ids: set[str] = set()
         for _ in range(_HISTORY_REF_ROUNDS):
             new = ids - seen_ids
@@ -736,10 +750,9 @@ def _collect_history(email: TrackedEmail, body: str) -> tuple[str, int, str]:
                 break
             seen_ids |= new
             wanted = {f"<{i}>" for i in new} | new
-            for row in s.scalars(base.where(TrackedEmail.rfc_message_id.in_(wanted)).limit(_HISTORY_MAX_CANDIDATES)):
-                if row.id not in found:
-                    found[row.id] = row
-                    ids |= set(thread_context.message_ids(row.in_reply_to, row.references))
+            take(list(s.scalars(
+                base.where(TrackedEmail.rfc_message_id.in_(wanted)).order_by(newest_first).limit(_HISTORY_MAX_CANDIDATES)
+            )), "ссылки")
         candidates = [_incoming(r, r.body_text) for r in found.values()]
         chain_pks = [c.pk for c in candidates] + [email.id]
         sent = [
@@ -752,13 +765,22 @@ def _collect_history(email: TrackedEmail, body: str) -> tuple[str, int, str]:
             )
         ]
     history = thread_context.collect(
-        current, candidates, sent,
+        current, candidates, sent, **party,
         subject_window_days=settings.history_subject_window_days,
         max_chars=settings.history_chars,
         max_messages=settings.history_max_messages,
     )
     prompt_body = thread_context.split_quote(body)[0] if history.cut_current_quote else body
     return thread_context.render(history), history.count, prompt_body
+
+
+def _party_rule() -> dict[str, Any]:
+    """Настройки same_party из конфига (skill thread-context)."""
+    extra = {d.strip().lower() for d in settings.public_domains_extra.split(",") if d.strip()}
+    return {
+        "same_domain": settings.history_same_domain,
+        "public_domains": thread_context.PUBLIC_DOMAINS | extra,
+    }
 
 
 def _incoming(row: TrackedEmail, body: str) -> thread_context.Incoming:

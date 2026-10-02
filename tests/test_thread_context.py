@@ -235,3 +235,55 @@ def test_plain_keeps_addresses_drops_own_tags():
     block = tc.render(tc.History(items=[tc.HistoryItem("in", T0, "x", "пишите на <ivan@x.ru>")]))
     plain = tc.plain(block)
     assert "<ivan@x.ru>" in plain and "письмо_истории" not in plain
+
+
+# --- домены ---
+
+def test_public_domains_extended():
+    assert not tc.same_party("a@ukr.net", "b@ukr.net")
+    assert not tc.same_party("a@yandex.kz", "b@yandex.kz")
+    assert tc.same_party("A@Corp.example", "a@corp.example")
+
+
+def test_same_domain_off():
+    assert not tc.same_party("a@corp.example", "b@corp.example", same_domain=False)
+    assert tc.same_party("a@corp.example", "a@corp.example", same_domain=False)
+
+
+def test_collect_same_domain_off_excludes_colleague():
+    colleague = mail(1, mid="a@x", sender="Пётр <petr@partner.example>", body="От коллеги")
+    current = mail(2, irt="<a@x>", sender="Иван <ivan@partner.example>", days=1)
+    assert collect(current, [colleague], same_domain=False).items == []
+
+
+# --- шапки цитат ---
+
+def test_year_alone_is_not_header():
+    body = "Новости.\nНаш бухгалтер с 2019 года пишет:\nвсё оплачено."
+    assert tc.split_quote(body)[1] == ""
+
+
+def test_russian_header_with_date_and_time():
+    body = "Да.\n\n2 окт. 2026 г., в 14:05, Иван <a@b.ru> пишет:\n> вопрос"
+    assert tc.split_quote(body)[0] == "Да."
+
+
+def test_gmail_one_line_header():
+    body = "Sure.\n\nOn Mon, Oct 2, 2026 at 2:05 PM John <a@b.com> wrote:\n> question"
+    assert tc.split_quote(body)[0] == "Sure."
+
+
+def test_gmail_wrapped_header_cut_at_first_line():
+    body = "Sure.\n\nOn Mon, Oct 2, 2026 at 2:05 PM John <\na@b.com> wrote:\n> question"
+    own, quote = tc.split_quote(body)
+    assert own == "Sure." and quote.startswith("On Mon")
+
+
+def test_own_line_with_time_before_header_not_swallowed():
+    body = "Встреча в 14:05\n2 окт. 2026 г., в 14:05, Иван <a@b.ru> пишет:\n> вопрос"
+    assert tc.split_quote(body)[0] == "Встреча в 14:05"
+
+
+def test_no_newlines_does_not_cut_or_crash():
+    body = "Одна длинная строка без переносов > и с пишет: внутри и 2 окт. 2026 " * 50
+    assert tc.split_quote(body) == (body.strip(), "")
