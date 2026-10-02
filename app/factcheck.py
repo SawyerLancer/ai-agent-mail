@@ -39,6 +39,29 @@ _TIME = re.compile(
     r"|\bв\s+([01]?\d|2[0-3])\s*(?:ч\b|час)",
     re.IGNORECASE,
 )
+# Относительные даты: «завтра», «в среду», «до конца недели». Ключ — смысл,
+# а не форма: «в пятницу» и «до пятницы» — одна и та же пятница.
+_RELATIVE: list[tuple[str, re.Pattern[str]]] = [
+    (key, re.compile(rx, re.IGNORECASE))
+    for key, rx in [
+        ("послезавтра", r"\bпослезавтра(?:шн\w*)?\b"),
+        ("завтра", r"\bзавтра(?:шн\w*)?\b"),
+        ("сегодня", r"\bсегодня(?:шн\w*)?\b"),
+        ("понедельник", r"\bпонедельник\w*"),
+        ("вторник", r"\bвторник\w*"),
+        # «среди», «средства» — не среда: только падежные окончания
+        ("среда", r"\bсред(?:а|ы|у|е|ой|ам|ами|ах)\b"),
+        ("четверг", r"\bчетверг\w*"),
+        ("пятница", r"\bпятниц\w*"),
+        ("суббота", r"\bсуббот\w*"),
+        ("воскресенье", r"\bвоскресень\w*"),
+        ("конец недели", r"\b(?:до|к)\s+конц[ау]\s+(?:(?:этой|текущей)\s+)?недели\b"),
+        ("конец месяца", r"\b(?:до|к)\s+конц[ау]\s+(?:(?:этого|текущего)\s+)?месяца\b"),
+        ("эта неделя", r"\bна\s+(?:этой|текущей)\s+неделе\b|\bна\s+эту\s+неделю\b"),
+        ("следующая неделя", r"\bна\s+(?:следующей|будущей)\s+неделе\b|\bна\s+(?:следующую|будущую)\s+неделю\b"),
+    ]
+]
+
 _MULT = {"тыс": 1_000, "млн": 1_000_000, "млрд": 1_000_000_000}
 _NUMBER = re.compile(
     r"(?<![\w.,])(\d{1,3}(?: \d{3})+|\d+)(?:[.,](\d+))?(?![\w])"
@@ -53,7 +76,7 @@ _SPACES = re.compile(r"[    ]")
 
 @dataclass(frozen=True)
 class Fact:
-    kind: str                 # money | date | time | email | url
+    kind: str                 # money | date | time | email | url | relative
     key: tuple                # нормализованное значение для сравнения
     surface: str              # как написано в тексте — для показа человеку
 
@@ -88,6 +111,8 @@ def extract(text: str) -> list[Fact]:
                 facts.append(fact)
                 t = _mask(t, m)
 
+    for key, pattern in _RELATIVE:
+        take(pattern, lambda m, key=key: Fact("relative", (key,), m.group(0).strip()))
     take(_EMAIL, lambda m: Fact("email", (m.group(0).lower().rstrip("."),), m.group(0)))
     take(_URL, lambda m: Fact("url", (m.group(0).lower().rstrip(".,;:!?"),), m.group(0).rstrip(".,;:!?")))
     take(_DATE_ISO, lambda m: _date(m.group(3), m.group(2), m.group(1), m.group(0)))

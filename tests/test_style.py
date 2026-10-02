@@ -140,7 +140,7 @@ def test_learn_skips_when_user_wrote_nothing(monkeypatch):
 
     monkeypatch.setattr(style.llm, "extract_style", fake)
     import asyncio
-    asyncio.run(style.learn(owner_id=OWNER, recipient="a@b.ru", user_texts=[], first_ai_body="A", sent_body="A"))
+    asyncio.run(style.learn(owner_id=OWNER, recipient="a@b.ru", user_texts=[], first_ai_body="A", sent_body="A", human_final=True))
     assert called == []
 
 
@@ -156,7 +156,74 @@ def test_learn_never_receives_incoming_body(monkeypatch):
     asyncio.run(style.learn(
         owner_id=OWNER, recipient="a@b.ru", user_texts=["короче"],
         first_ai_body="Добрый день. Длинный ответ.", sent_body="Добрый день.",
+        human_final=True,
     ))
     assert set(seen) == {"user_texts", "edits", "existing"}
     with SessionLocal() as s:
         assert s.query(StyleRule).one().text == "Писать коротко"
+
+
+def test_one_confirmation_per_rule_per_learn():
+    with SessionLocal() as s:
+        rule = StyleRule(owner_id=OWNER, scope="global", text="Писать коротко", norm_text="писать коротко", hits=1)
+        s.add(rule)
+        s.commit()
+        style.apply_ops(
+            s, owner_id=OWNER, recipient="", known_ids={rule.id},
+            ops=[{"op": "hit", "id": rule.id}, {"op": "hit", "id": rule.id},
+                 _new("Писать коротко"), _new("писать коротко.")],
+        )
+        s.commit()
+        assert s.get(StyleRule, rule.id).hits == 2
+
+
+def test_two_identical_new_count_once():
+    with SessionLocal() as s:
+        style.apply_ops(s, owner_id=OWNER, recipient="", known_ids=set(),
+                        ops=[_new("Без воды"), _new("без воды")])
+        s.commit()
+        rule = s.query(StyleRule).one()
+        assert rule.hits == 1 and rule.status == "candidate"
+
+
+def _capture(monkeypatch):
+    seen = {}
+
+    async def fake(**kw):
+        seen.update(kw)
+        return "[]"
+
+    monkeypatch.setattr(style.llm, "extract_style", fake)
+    return seen
+
+
+def test_edits_learned_only_from_human_text(monkeypatch):
+    import asyncio
+    seen = _capture(monkeypatch)
+    asyncio.run(style.learn(
+        owner_id=OWNER, recipient="a@b.ru", user_texts=[],
+        first_ai_body="Добрый день. Длинный ответ.", sent_body="Привет. Коротко.",
+        human_final=True,
+    ))
+    assert seen["edits"]
+
+
+def test_edits_after_revise_not_learned(monkeypatch):
+    import asyncio
+    seen = _capture(monkeypatch)
+    asyncio.run(style.learn(
+        owner_id=OWNER, recipient="a@b.ru", user_texts=["короче"],
+        first_ai_body="Добрый день. Длинный ответ.", sent_body="Добрый день. Коротко.",
+        human_final=False,
+    ))
+    assert seen["edits"] == [] and seen["user_texts"] == ["короче"]
+
+
+def test_revise_only_without_instructions_skips_learning(monkeypatch):
+    import asyncio
+    seen = _capture(monkeypatch)
+    asyncio.run(style.learn(
+        owner_id=OWNER, recipient="a@b.ru", user_texts=[],
+        first_ai_body="A", sent_body="B", human_final=False,
+    ))
+    assert seen == {}

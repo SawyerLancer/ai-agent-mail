@@ -7,13 +7,13 @@ import json
 import logging
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from . import cards, factcheck, llm, proofdiff, style
 from .config import settings
 from .db import Draft, SessionLocal, TrackedEmail
-from .mail import mail
+from .mail import MailToolError, mail
 from .pachca import pachca
 
 log = logging.getLogger(__name__)
@@ -209,12 +209,15 @@ async def _start_reply(email_pk: int, chat_id: int) -> None:
 
 async def _start_forward(email_pk: int, chat_id: int) -> None:
     thread_id, email = await _thread_for(email_pk)
+    # Как у ответа: источник для проверки, не добавила ли модель фактов в комментарий.
+    body = await _body_of(email)
     with SessionLocal() as s:
         draft = Draft(
             email_pk=email_pk,
             thread_id=thread_id,
             kind="forward",
             body="(без комментария)",
+            source_text=body[: settings.body_chars_for_llm],
         )
         s.add(draft)
         s.commit()
@@ -291,6 +294,9 @@ async def _do_delete(email_pk: int, chat_id: int, message_id: int) -> None:
 async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
     with SessionLocal() as s:
         draft = s.get(Draft, draft_id)
+        if draft is not None and draft.status == "sending":
+            await pachca.send_to_thread(draft.thread_id, "Уже отправляю — подождите.")
+            return
         if draft is None or draft.status != "editing":
             await pachca.drop_buttons(message_id, content="_Черновик уже неактуален._")
             return
@@ -302,51 +308,108 @@ async def _send_draft(draft_id: int, chat_id: int, message_id: int) -> None:
         uid, subject, sender = email.uid, email.subject, email.sender
         rfc_id = email.rfc_message_id
 
+    if kind == "forward":
+        if not recipients:
+            await pachca.send_to_thread(thread_id, "Сначала укажите адрес получателя в этом треде.")
+            return
+        to_list = _split(recipients)
+        done = f"↪️ Переслано: {recipients}"
+    else:
+        to = _address_of(sender)
+        if not to:
+            await pachca.send_to_thread(
+                thread_id, f"Не разобрал адрес отправителя ({sender}). Отправка отменена."
+            )
+            return
+        to_list = [to]
+        done = f"📨 Ответ отправлен на {to}"
+
+    # editing → sending одной условной записью: второе нажатие (или повторная
+    # доставка события) сюда уже не пройдёт.
+    with SessionLocal() as s:
+        taken = s.execute(
+            update(Draft)
+            .where(Draft.id == draft_id, Draft.status == "editing")
+            .values(status="sending")
+        ).rowcount
+        s.commit()
+    if not taken:
+        await pachca.send_to_thread(thread_id, "Уже отправляю — подождите.")
+        return
+    await pachca.drop_buttons(message_id, content=f"📨 Отправляю…\n\n{body}")
+
+    # С запасом на расхождение часов с почтовым сервером.
+    started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
+    reply_subject = _re_subject(subject)
     try:
         if kind == "forward":
-            if not recipients:
-                await pachca.send_to_thread(
-                    thread_id, "Сначала укажите адрес получателя в этом треде."
-                )
-                return
-            await mail.forward(uid=uid, to=_split(recipients), note=body)
-            done = f"↪️ Переслано: {recipients}"
+            await mail.forward(uid=uid, to=to_list, note=body)
         else:
-            to = _address_of(sender)
-            if not to:
-                await pachca.send_to_thread(
-                    thread_id, f"Не разобрал адрес отправителя ({sender}). Отправка отменена."
-                )
-                return
             await mail.send(
-                to=[to],
-                subject=_re_subject(subject),
+                to=to_list,
+                subject=reply_subject,
                 body=body,
                 in_reply_to=rfc_id or None,
                 references=rfc_id or None,
             )
-            done = f"📨 Ответ отправлен на {to}"
-    except Exception as exc:  # noqa: BLE001 - причину показываем человеку
+    except MailToolError as exc:
+        # Сервер сам сказал «нет» — письмо точно не ушло.
         log.error("отправка не удалась", exc_info=True)
-        await pachca.send_to_thread(thread_id, f"Отправить не удалось: {exc}")
+        await _back_to_editing(draft_id, f"Отправить не удалось: {exc}")
         return
+    except Exception:  # noqa: BLE001 - таймаут или обрыв: результат неизвестен
+        log.error("отправка без ответа сервера, проверяю «Отправленные»", exc_info=True)
+        if not await _found_in_sent(
+            to=to_list[0], since=started, subject=None if kind == "forward" else reply_subject
+        ):
+            await _back_to_editing(
+                draft_id,
+                "Не уверен, ушло ли письмо — проверьте «Отправленные». "
+                "Если его там нет, отправьте ещё раз.",
+            )
+            return
+        log.info("письмо нашлось в «Отправленных», считаю отправленным")
 
     with SessionLocal() as s:
         draft = s.get(Draft, draft_id)
-        if draft is not None:
-            draft.status = "sent"
-            s.commit()
-            learn_from = (_user_texts(draft), draft.first_ai_body)
+        assert draft is not None
+        draft.status = "sent"
+        s.commit()
+        user_texts, first_ai = _user_texts(draft), draft.first_ai_body
+        human_final = draft.body_source == "human"
     await pachca.drop_buttons(message_id, content=f"{done}\n\n{body}")
 
     # Память стиля — в фоне: ответ в чате не ждёт модель, ошибка не мешает.
     # Пересылки не учим: комментарий к ним слишком короткий.
-    if kind == "reply" and draft is not None:
-        user_texts, first_ai = learn_from
+    if kind == "reply":
         _background(style.learn(
             owner_id=_owner_id(), recipient=_address_of(sender),
             user_texts=user_texts, first_ai_body=first_ai, sent_body=body,
+            human_final=human_final,
         ))
+
+
+async def _found_in_sent(*, to: str, since: dt.datetime, subject: str | None) -> bool:
+    try:
+        return await mail.find_sent(to=to, since=since, subject=subject)
+    except Exception:  # noqa: BLE001 - не смогли проверить = не уверены
+        log.warning("не удалось проверить «Отправленные»", exc_info=True)
+        return False
+
+
+async def _back_to_editing(draft_id: int, note: str) -> None:
+    """Вернуть черновик к правке и показать его заново с кнопками."""
+    with SessionLocal() as s:
+        draft = s.get(Draft, draft_id)
+        assert draft is not None
+        draft.status = "editing"
+        s.commit()
+        thread_id = draft.thread_id
+        raw = bool(draft.original_text) and draft.original_text != draft.body
+        card, buttons = cards.draft_card(draft), cards.draft_buttons(draft_id, raw=raw)
+    await pachca.send_to_thread(thread_id, note)
+    msg = await pachca.send_to_thread(thread_id, card, buttons)
+    _remember_preview(draft_id, msg.get("id"))
 
 
 async def _regen_draft(draft_id: int, chat_id: int, message_id: int) -> None:
@@ -427,7 +490,7 @@ async def _proofread_own(draft_id: int, thread_id: int, original: str, old_previ
     with SessionLocal() as s:
         draft = s.get(Draft, draft_id)
         assert draft is not None
-        _set_body(s, draft, fixed)
+        _set_body(s, draft, fixed, source="human")   # вычитка: слова — человека
         draft.original_text = original    # _set_body сбрасывает — здесь он нужен
         draft.status = "editing"
         s.commit()
@@ -446,7 +509,7 @@ async def _use_raw(draft_id: int, message_id: int) -> None:
             await pachca.drop_buttons(message_id, content="_Черновик уже неактуален._")
             return
         original = draft.original_text
-        _set_body(s, draft, original)
+        _set_body(s, draft, original, source="human")
         draft.original_text = original
         s.commit()
         thread_id = draft.thread_id
@@ -465,7 +528,7 @@ async def expire_drafts() -> int:
     border = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=settings.draft_ttl_hours)
     with SessionLocal() as s:
         stale = s.scalars(
-            select(Draft).where(Draft.status.in_(_OPEN), Draft.updated_at < border)
+            select(Draft).where(Draft.status.in_(_EXPIRABLE), Draft.updated_at < border)
         ).all()
         previews = [d.preview_message_id for d in stale if d.preview_message_id]
         for d in stale:
@@ -492,6 +555,8 @@ async def _cancel(draft_id: int, chat_id: int, message_id: int) -> None:
 
 # Черновики, с которыми ещё работают: их ищут правки и гасит срок жизни.
 _OPEN = ("editing", "awaiting_text")
+# «sending» навсегда остаётся, только если бот упал посреди отправки — гасим сроком.
+_EXPIRABLE = (*_OPEN, "sending")
 
 _bg_tasks: set[asyncio.Task[None]] = set()   # держим ссылки, иначе GC снимет задачу
 
@@ -528,13 +593,14 @@ def _add_user_text(draft: Draft, text: str) -> None:
     draft.user_texts = json.dumps(_user_texts(draft) + [text], ensure_ascii=False)
 
 
-def _set_body(s: Session, draft: Draft, body: str) -> None:
+def _set_body(s: Session, draft: Draft, body: str, *, source: str = "ai") -> None:
     """Новое тело черновика + проверка, не добавила ли модель фактов.
 
     Источники — письмо и тексты пользователя, а не прошлый черновик: иначе
     выдуманная однажды сумма после правки перестала бы помечаться.
     """
     draft.body = body
+    draft.body_source = source
     draft.original_text = ""      # «Без правок» имеет смысл только сразу после вычитки
     email = s.get(TrackedEmail, draft.email_pk)
     sources = [draft.source_text, *_user_texts(draft), settings.signature]

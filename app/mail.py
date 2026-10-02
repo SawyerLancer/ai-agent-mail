@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -18,6 +19,13 @@ from mcp.client.stdio import get_default_environment, stdio_client
 from .config import settings
 
 log = logging.getLogger(__name__)
+
+class MailToolError(RuntimeError):
+    """MCP-сервер сам ответил ошибкой: операция точно не выполнена.
+
+    В отличие от таймаута и обрыва связи, где результат неизвестен.
+    """
+
 
 # Предохранитель от листания всего ящика: 20 × POLL_PAGE_SIZE писем за проход.
 _MAX_POLL_PAGES = 20
@@ -40,7 +48,7 @@ class MailClient:
         self._ready: asyncio.Event | None = None
         self._stop: asyncio.Event | None = None
         self._error: BaseException | None = None
-        self._trash: str | None = None   # имя корзины, ищется один раз
+        self._special: dict[str, str] = {}   # флаг RFC 6154 → имя папки, ищется один раз
 
     async def start(self) -> None:
         async with self._lock:
@@ -102,11 +110,15 @@ class MailClient:
         async with self._lock:
             await self._close()
 
-    async def call(self, tool: str, args: dict[str, Any]) -> Any:
-        """Вызвать инструмент MCP. При обрыве stdio — одна попытка переподключения."""
+    async def call(self, tool: str, args: dict[str, Any], *, retry: bool = True) -> Any:
+        """Вызвать инструмент MCP. При обрыве stdio — одна попытка переподключения.
+
+        retry=False — для отправки: после таймаута письмо могло уже уйти, и
+        повтор отправил бы его второй раз. Сессию всё равно переподнимем.
+        """
         async with self._lock:
             result = None
-            for attempt in (1, 2):
+            for attempt in ((1, 2) if retry else (2,)):
                 if self._session is None:
                     await self._connect()
                 try:
@@ -129,7 +141,7 @@ class MailClient:
                     await self._close()
 
         if getattr(result, "isError", False):
-            raise RuntimeError(f"MCP {tool}: {_as_text(result)}")
+            raise MailToolError(f"MCP {tool}: {_as_text(result)}")
 
         structured = getattr(result, "structuredContent", None)
         if structured:
@@ -219,7 +231,7 @@ class MailClient:
             args["in_reply_to"] = in_reply_to
         if references:
             args["references"] = references
-        return await self.call("send_email", args)
+        return await self.call("send_email", args, retry=False)
 
     async def forward(self, *, uid: int, to: list[str], note: str = "") -> Any:
         return await self.call(
@@ -232,6 +244,7 @@ class MailClient:
                 "body": note,
                 "include_attachments": True,
             },
+            retry=False,
         )
 
     async def delete(self, uid: int) -> Any:
@@ -246,24 +259,50 @@ class MailClient:
                 "account_name": settings.email_account,
                 "email_ids": [_eid(uid)],
                 "source_mailbox": settings.mailbox,
-                "destination_mailbox": await self._trash_mailbox(),
+                "destination_mailbox": await self._special_mailbox("\\trash"),
             },
         )
 
-    async def _trash_mailbox(self) -> str:
-        """Корзина по флагу \\Trash (RFC 6154), а не по имени: у провайдеров
-        оно разное и бывает локализованным. Нет флага — ошибка, а не EXPUNGE."""
-        if self._trash is None:
+    async def _special_mailbox(self, flag: str) -> str:
+        """Папка по флагу RFC 6154 (\\Trash, \\Sent), а не по имени: у провайдеров
+        оно разное и бывает локализованным. Нет флага — ошибка, а не догадка."""
+        if flag not in self._special:
             data = await self.call("list_mailboxes", {"account_name": settings.email_account})
             boxes = _extract_list(data, ("mailboxes", "items", "results", "data"))
             for box in boxes:
                 flags = {str(f).lower() for f in box.get("flags") or []}
-                if "\\trash" in flags:
-                    self._trash = str(box.get("name") or "") or None
+                name = str(box.get("name") or "")
+                if flag in flags and name:
+                    self._special[flag] = name
                     break
-            if not self._trash:
-                raise RuntimeError("в ящике не найдена папка с флагом \\Trash")
-        return self._trash
+            else:
+                raise RuntimeError(f"в ящике не найдена папка с флагом {flag}")
+        return self._special[flag]
+
+    async def find_sent(self, *, to: str, since: dt.datetime, subject: str | None = None) -> bool:
+        """Есть ли в «Отправленных» письмо этому адресату не раньше since.
+
+        Свой Message-ID задать нельзя (send_email не принимает заголовки),
+        поэтому ищем по адресату, времени и, для ответа, теме. Если сервер
+        отправил письмо, но не успел сохранить копию, — не найдём.
+        """
+        data = await self.call(
+            "list_emails_metadata",
+            {
+                "account_name": settings.email_account,
+                "mailbox": await self._special_mailbox("\\sent"),
+                "to_address": to,
+                "since": since.isoformat(),
+                "page": 1,
+                "page_size": 10,
+                "order": "desc",
+            },
+        )
+        want = _norm_subject(subject) if subject is not None else None
+        for it in _extract_list(data, ("emails", "items", "results", "data")):
+            if want is None or _norm_subject(str(it.get("subject") or "")) == want:
+                return True
+        return False
 
     async def archive(self, uid: int) -> Any:
         return await self.call(
@@ -298,6 +337,10 @@ def _server_env() -> dict[str, str]:
         {k: v for k, v in os.environ.items() if k.startswith("MCP_EMAIL_SERVER_")}
     )
     return env
+
+
+def _norm_subject(subject: str) -> str:
+    return " ".join(subject.split()).casefold()
 
 
 def _eid(uid: int) -> str:

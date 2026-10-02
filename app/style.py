@@ -131,13 +131,17 @@ def apply_ops(
     """Применить операции модели. Возвращает число изменений."""
     recipient = recipient.lower()
     changed = 0
+    # Одно обучение — не больше одного подтверждения на правило: модель могла
+    # повторить один и тот же hit или new, а порог активации — это число писем.
+    confirmed: set[int] = set()
     for op in ops:
         if op.get("op") == "hit":
             rid = op.get("id")
-            if isinstance(rid, int) and rid in known_ids:
+            if isinstance(rid, int) and rid in known_ids and rid not in confirmed:
                 rule = s.get(StyleRule, rid)
                 if rule is not None and rule.owner_id == owner_id:
                     _hit(s, rule)
+                    confirmed.add(rule.id)
                     changed += 1
         elif op.get("op") == "new":
             scope = "recipient" if op.get("scope") == "recipient" else "global"
@@ -159,7 +163,10 @@ def apply_ops(
                 )
             )
             if same is not None:
+                if same.id in confirmed:
+                    continue
                 _hit(s, same)
+                confirmed.add(same.id)
             else:
                 rule = StyleRule(
                     owner_id=owner_id, scope=scope, recipient=rcpt, text=text,
@@ -168,6 +175,7 @@ def apply_ops(
                 s.add(rule)
                 s.flush()
                 _hit(s, rule)     # hits=1; при пороге 1 сразу станет active
+                confirmed.add(rule.id)
             changed += 1
     s.flush()
     _prune(s, owner_id, "global", "")
@@ -224,10 +232,16 @@ async def learn(
     user_texts: list[str],
     first_ai_body: str,
     sent_body: str,
+    human_final: bool,
 ) -> None:
-    """Обучение после отправки. Фоновая задача: любые ошибки только в лог."""
+    """Обучение после отправки. Фоновая задача: любые ошибки только в лог.
+
+    human_final — итоговый текст написал человек («Свой текст», «Без правок»).
+    Только тогда разница с черновиком ИИ — его стиль; после llm.revise это
+    переформулировки модели, их не учим. Указания (user_texts) учим всегда.
+    """
     try:
-        edits = edits_between(first_ai_body, sent_body)
+        edits = edits_between(first_ai_body, sent_body) if human_final else []
         if not user_texts and not edits:
             return          # человек ничего не писал сам — учиться не на чем
         with SessionLocal() as s:

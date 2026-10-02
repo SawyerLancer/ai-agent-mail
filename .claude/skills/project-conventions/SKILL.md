@@ -38,7 +38,8 @@ DB_PATH=./data/bot.sqlite3 uvicorn app.main:app --port 8000
 `./data/` создать заранее (в `.gitignore`).
 
 ### Тесты
-`tests/` (pytest, `requirements-dev.txt`). Чистые модули (`factcheck`,
+`tests/` (pytest, `requirements-dev.txt`). CI — `.github/workflows/tests.yml`:
+pytest на push и PR, Python 3.13 (бот в Docker — 3.12). Чистые модули (`factcheck`,
 `proofdiff`) — без заглушек; БД — настоящая SQLite во временной папке
 (`tests/conftest.py`); Пачка, почта и модель — подставные объекты
 (`tests/test_draft_flow.py`). Сеть в тестах не трогаем. Запуск в образе бота

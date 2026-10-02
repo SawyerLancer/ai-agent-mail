@@ -67,7 +67,8 @@ class Draft(Base):
     email_pk: Mapped[int] = mapped_column(Integer, index=True)
     thread_id: Mapped[int] = mapped_column(BigInteger, index=True)
     kind: Mapped[str] = mapped_column(String(16))       # reply | forward
-    # editing | awaiting_text (ждём «свой текст») | sent | cancelled | expired
+    # editing | awaiting_text (ждём «свой текст») | sending (ушло в MCP, ждём ответа)
+    # | sent | cancelled | expired
     status: Mapped[str] = mapped_column(String(16), default="editing")
     body: Mapped[str] = mapped_column(Text, default="")
     recipients: Mapped[str] = mapped_column(Text, default="")  # для forward, через запятую
@@ -86,6 +87,9 @@ class Draft(Base):
     source_text: Mapped[str] = mapped_column(Text, default="")
     # JSON-список текстов пользователя: правки из треда и «Свой текст»
     user_texts: Mapped[str] = mapped_column(Text, default="[]")
+    # кто автор текущего body: ai (draft_reply/revise) или human («Свой текст»,
+    # «Без правок»). Правки черновика учим только у human (skill style-memory).
+    body_source: Mapped[str] = mapped_column(String(8), default="ai")
     # JSON-список того, что модель добавила от себя (для «⚠️» в превью)
     added_facts: Mapped[str] = mapped_column(Text, default="[]")
 
